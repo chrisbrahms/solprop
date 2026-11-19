@@ -337,6 +337,27 @@ def test_window_lidt_conversion_and_fwhm_override():
     )
 
 
+def test_binding_lidt_keeps_a_too_small_fixed_aperture_as_hisol():
+    """Pins a quirk inherited from HiSol ``details(::WindowConstraint)``.
+
+    HiSol raises the distance to the LIDT distance after its aperture check and never
+    re-checks, so the distance is finite although the fixed aperture is too small for
+    the beam at ``wavelength_max`` there. Kept on purpose (HiSol is the reference); this
+    test flags it if that is ever changed.
+    """
+    constraint = window(aperture_radius=40e-3, lidt=0.5)
+    out = point(constraint, energy=0.1e-3, fwhm=25e-15)
+    # HiSol reference (Julia, branch new-constraints): WindowConstraint(800e-9, 2.6e-20;
+    # elastic_limit=55e6, λmax=1e-6, aperture=40e-3, LIDT=0.5) at a = 100e-6,
+    # energy = 1e-4, τfwhm = 25e-15, pressure = 3.0 gives distance 6.341323676169619,
+    # thickness 0.005113632404038871, aperture 0.04.
+    assert out["distance"] == pytest.approx(6.341323676169619, rel=1e-12)
+    assert out["thickness"] == pytest.approx(0.005113632404038871, rel=1e-12)
+    assert out["aperture_radius"] == 40e-3
+    needed = 2.0 * diverged_beam(A, WL_MAX, out["distance"])
+    assert out["aperture_radius"] < needed
+
+
 def test_window_pressure_difference_is_at_least_one_bar():
     # HiSol reference: pressure 0.2 and 1.5 bar both use a 1 bar difference.
     low = point(window(), pressure=0.2)

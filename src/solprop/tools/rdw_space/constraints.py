@@ -283,8 +283,18 @@ class WindowConstraint:
     pressure difference ``max(pressure - 1, 1)`` bar (so vacuum, too) over its aperture
     with safety factor `s_break`, and its aperture radius is at least `aperture_factor`
     times the 1/e^2 beam radius at `wavelength_max`. Thickness and aperture radius are
-    each fixed or variable (``None``). A fixed thickness that cannot hold the pressure,
-    or a fixed aperture the beam does not fit through, gives an infinite distance.
+    each fixed or variable (``None``). Without `lidt`, a fixed thickness that cannot
+    hold the pressure, or a fixed aperture the beam does not fit through, gives an
+    infinite distance.
+
+    With a binding `lidt` the rule above no longer holds: the distance is raised to the
+    damage distance *after* the thickness and aperture are settled, and nothing is
+    re-checked, so the distance can be finite while the returned thickness and aperture
+    belong to the shorter B-integral distance and can be too small for the beam at the
+    returned distance (a fixed aperture the beam does not fit through, or a variable
+    aperture sized for the shorter distance). This is inherited from HiSol
+    ``Focusing.jl`` ``details(::WindowConstraint)``, kept so that HiSol stays the
+    reference, and is reported as a likely upstream quirk.
 
     Attributes
     ----------
@@ -459,7 +469,12 @@ def details(
         radius on the mirror at its reference wavelength, m); a window adds
         ``"thickness"`` and ``"aperture_radius"`` (m) and ``"beam_radius"`` (1/e^2
         radius on the window at its reference wavelength, m). Where no window exists
-        the distance is infinite; a non-finite input to a window gives NaN.
+        the distance is infinite; a non-finite input to a window gives NaN. With a
+        window's binding `lidt` the distance can be finite while the returned thickness
+        and aperture belong to the shorter B-integral distance, too small for the beam
+        at the returned distance (inherited from HiSol ``Focusing.jl``
+        ``details(::WindowConstraint)``; a likely upstream quirk, see
+        :class:`WindowConstraint`).
 
     Raises
     ------
