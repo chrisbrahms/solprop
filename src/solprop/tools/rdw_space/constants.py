@@ -221,7 +221,7 @@ def gas_constants(
 
 def pressure_table(
     gas: str, rho_max: float, points: int = 1024
-) -> Callable[[Float[np.ndarray, " n"]], Float[np.ndarray, " n"]]:
+) -> Callable[[Float[np.ndarray, "..."]], Float[np.ndarray, "..."]]:
     """Return a fast pressure of density, a spline of the real-gas equation of state.
 
     Calling :func:`solprop.physdata.pressure` at every grid point would be slow; this
@@ -241,6 +241,8 @@ def pressure_table(
     -------
     callable
         Maps number densities in m^-3 (within 1e18 to `rho_max`) to pressures in bar.
+        NaN maps to NaN. A finite density outside the table raises ``ValueError``
+        rather than return an extrapolated, quietly wrong pressure.
 
     Raises
     ------
@@ -261,7 +263,16 @@ def pressure_table(
     log_pressure = np.log10([physdata.pressure(gas, 10.0**x) for x in log_rho])
     spline = CubicSpline(log_rho, log_pressure)
 
-    def _table(density: Float[np.ndarray, " n"]) -> Float[np.ndarray, " n"]:
-        return 10.0 ** spline(np.log10(density))
+    def _table(density: Float[np.ndarray, "..."]) -> Float[np.ndarray, "..."]:
+        density = np.asarray(density, dtype=float)
+        finite = density[np.isfinite(density)]
+        if np.any((finite < _RHO_MIN) | (finite > rho_max)):
+            msg = (
+                f"density outside the pressure table's {_RHO_MIN:g} to {rho_max:g} "
+                f"m^-3 (got {finite.min():g} to {finite.max():g})"
+            )
+            raise ValueError(msg)
+        with np.errstate(invalid="ignore"):
+            return 10.0 ** spline(np.log10(density))
 
     return _table

@@ -32,6 +32,7 @@ from solprop.tools.rdw_space.soliton_term import (
     solprop_half,
 )
 from solprop.tools.rdw_space.solve import Solved, solve_rho
+from solprop.tools.rdw_space.space import RdwSpace, SpaceInputs, SpaceResult
 
 __all__ = [
     "DEFAULT_SOLITON_TERM",
@@ -40,8 +41,11 @@ __all__ = [
     "FixedConstraint",
     "NoConstraint",
     "Ratios",
+    "RdwSpace",
     "SolitonTerm",
     "Solved",
+    "SpaceInputs",
+    "SpaceResult",
     "WindowConstraint",
     "WindowPreset",
     "details",
