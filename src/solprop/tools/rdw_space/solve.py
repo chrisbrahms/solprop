@@ -65,7 +65,7 @@ carry NaN in every density-dependent field.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 from jaxtyping import Bool, Float
@@ -255,6 +255,22 @@ def _check_inputs(
         raise ValueError(f"fwhm must be finite and positive, got {fwhm!r}")
 
 
+def _check_constants(c: GasConstants) -> None:
+    """Refuse constants with a non-finite number, naming the field.
+
+    - ``c``: the tier-1 constants.
+    """
+    for field in fields(c):
+        value = getattr(c, field.name)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"GasConstants.{field.name} must be finite, got {value!r}")
+
+
+# Rounding floor of K = dbeta_rho - (target + term)/rho, in units of dbeta_rho: a
+# |K| below it is indistinguishable from zero, so it is a root, and a secant slope
+# built from such values is noise that must not be read as "no root".
+_K_FLOOR = 16.0 * np.finfo(float).eps
+
 # Smallest 1/N searched, so the search stops just short of the zero-dispersion density,
 # where N is infinite (rho_z is excluded: there is no soliton there).
 _U_FLOOR = 1e-8
@@ -294,6 +310,8 @@ def _first_step(
     u_lin: Float[np.ndarray, " n"],
     k_lin: Float[np.ndarray, " n"],
     u_cap: Float[np.ndarray, " n"],
+    *,
+    tol: float,
 ) -> _Iteration:
     """Return the iteration after one fixed-point step from the linear density.
 
@@ -303,8 +321,13 @@ def _first_step(
     the frozen bracket is not positive, the term per density already exceeds the gas
     term and only grows: there is no root.
 
+    If the step moves the density by no more than ``tol`` (relative), or lands at
+    ``|K|`` below the rounding floor, the point has converged with a root. A
+    non-finite ``K`` (a broken term) masks the point as having no root.
+
     - ``u_lin``, ``k_lin``: start, with ``K(u_lin) = k_lin < 0``.
     - ``u_cap``: smallest ``u`` searched.
+    - ``tol``: relative tolerance on the density.
     """
     n = u_lin.size
     state = _Iteration(
@@ -317,24 +340,30 @@ def _first_step(
         done=np.zeros(n, dtype=bool),
         no_root=np.zeros(n, dtype=bool),
     )
+    floor = _K_FLOOR * problem.constants.dbeta_rho
+    # The term is already at the rounding floor at the linear density: that is the root.
+    state.stop(np.flatnonzero(np.abs(k_lin) <= floor), root=True)
     net = problem.constants.dbeta_rho + k_lin
     positive = net > 0.0
+    rho_lin = problem.rho_of_u(u_lin)
     rho_1 = problem.target / np.where(positive, net, 1.0)
     inside = positive & (rho_1 < problem.rho_of_u(u_cap))
-    state.stop(np.flatnonzero(~inside), root=False)
-    index = np.flatnonzero(inside)
+    state.stop(np.flatnonzero(~inside & ~state.done), root=False)
+    index = np.flatnonzero(inside & ~state.done)
     if index.size == 0:
         return state
     part = problem.subset(index)
     u_1 = part.u_of_rho(rho_1[index])
     k_1 = part.scaled_residual(u_1)
+    state.stop(index[~np.isfinite(k_1)], root=False)
     below = k_1 <= 0.0
     step = index[below]
     state.u_b[step] = u_1[below]
     state.k_b[step] = k_1[below]
     # Overshoot (only for a term that breaks the assumptions): bisect from here.
-    state.u_lo[index[~below]] = u_1[~below]
-    state.stop(index[k_1 == 0.0], root=True)
+    state.u_lo[index[k_1 > 0.0]] = u_1[k_1 > 0.0]
+    still = np.abs(rho_1[index] - rho_lin[index]) <= tol * rho_lin[index]
+    state.stop(index[(still | (np.abs(k_1) <= floor)) & below], root=True)
     return state
 
 
@@ -346,6 +375,7 @@ def _iterate(
     - ``tol``: relative tolerance on the density.
     - ``max_iter``: largest number of iterations; points still running are masked.
     """
+    floor = _K_FLOOR * problem.constants.dbeta_rho
     for _ in range(max_iter):
         index = np.flatnonzero(~state.done)
         if index.size == 0:
@@ -367,6 +397,12 @@ def _iterate(
         index, trial, at_cap = index[live], trial[live], at_cap[live]
         u_b, u_lo, part = u_b[live], u_lo[live], part.subset(np.flatnonzero(live))
         k_trial = part.scaled_residual(trial)
+        # A non-finite residual (a broken term) is no root, never a solution.
+        broken = ~np.isfinite(k_trial)
+        state.stop(index[broken], root=False)
+        index, trial, at_cap = index[~broken], trial[~broken], at_cap[~broken]
+        u_b, k_trial = u_b[~broken], k_trial[~broken]
+        part = part.subset(np.flatnonzero(~broken))
 
         below = k_trial <= 0.0
         moved = index[below]
@@ -380,10 +416,13 @@ def _iterate(
         rho_new = part.rho_of_u(new_b)
         bracket_now = ~np.isnan(new_lo)
         far = part.rho_of_u(np.where(bracket_now, new_lo, u_b))
-        converged = (k_trial == 0.0) | (np.abs(far - rho_new) <= tol * rho_new)
+        converged = (np.abs(k_trial) <= floor) | (
+            np.abs(far - rho_new) <= tol * rho_new
+        )
         # At the cap with K < 0, the root lies beyond the searched densities.
-        state.stop(index[at_cap & (k_trial < 0.0)], root=False)
-        state.stop(index[converged & ~(at_cap & (k_trial < 0.0))], root=True)
+        beyond = at_cap & (k_trial < -floor)
+        state.stop(index[beyond], root=False)
+        state.stop(index[converged & ~beyond], root=True)
     # Points still running after max_iter did not converge: masked as no root.
     state.stop(np.flatnonzero(~state.done), root=False)
 
@@ -421,7 +460,9 @@ def solve_rho(
         fall as the density rises and ``F / rho`` is concave in ``1/N``, as for both
         shipped terms.
     tol : float, optional
-        Relative tolerance on the density. Default 1e-10.
+        Relative tolerance on the density. Default 1e-10. A point whose residual
+        ``F / rho`` is below the rounding floor (16 machine epsilons of
+        ``dbeta_rho``) has converged whatever the step.
     max_iter : int, optional
         Largest number of iterations; points not converged by then are masked as
         ``no_root``. Default 60.
@@ -429,13 +470,17 @@ def solve_rho(
     Returns
     -------
     Solved
-        Arrays of shape ``(ne, na)``: rows are energies, columns radii.
+        Arrays of shape ``(ne, na)``: rows are energies, columns radii. A point where
+        the term or the soliton order is not finite is masked ``no_root`` and is never
+        ``ok``.
 
     Raises
     ------
     ValueError
-        If a grid is not a non-empty 1-D array of finite positive numbers, `fwhm` is
-        not finite and positive, the gas dispersion ``g2`` at the pump is not
+        If a grid is not a non-empty 1-D array of finite positive numbers, or `fwhm`
+        is not finite and positive: these are the caller's programming errors, not
+        masked points. Also if a float field of `c` is not finite (the message names
+        the field), the gas dispersion ``g2`` at the pump is not
         positive (there would be no zero-dispersion density to bound the search), or
         the term is negative at the linear density.
 
@@ -453,6 +498,7 @@ def solve_rho(
     a = np.asarray(a, dtype=float)
     energy = np.asarray(energy, dtype=float)
     _check_inputs(a, energy, fwhm)
+    _check_constants(c)
     if not c.g2 > 0.0:
         raise ValueError(
             f"the gas must have normal dispersion at the pump (g2 > 0), got {c.g2!r}"
@@ -481,8 +527,11 @@ def solve_rho(
     term_lin = part.soliton_term(rho_lin[anomalous], order_lin)
     if np.any(term_lin < 0.0):
         raise ValueError("the soliton term must not be negative")
+    # A non-finite order or term (a broken term) masks the point: never a solution.
+    broken = anomalous[~(np.isfinite(term_lin) & np.isfinite(order_lin))]
+    rho[broken] = np.nan
     # Where the term vanishes (N <= 1/2 for the shipped terms), rho_lin is the root.
-    moving = term_lin > 0.0
+    moving = np.isfinite(order_lin) & (term_lin > 0.0)
     index = anomalous[moving]
     part = problem.subset(index)
     # The only upper bound is physical: the zero-dispersion density, u = 1/N = 0.
@@ -492,11 +541,13 @@ def solve_rho(
         1.0 / order_lin[moving],
         -term_lin[moving] / rho_lin[index],
         u_cap,
+        tol=tol,
     )
     _iterate(part, state, tol=tol, max_iter=max_iter)
     rho[index] = np.where(state.no_root, np.nan, part.rho_of_u(state.u_b))
     no_root = np.zeros(rho.size, dtype=bool)
     no_root[index] = state.no_root
+    no_root[broken] = True
 
     beta2 = problem.beta2(rho)
     gamma = rho * problem.gamma_hat
@@ -504,6 +555,11 @@ def solve_rho(
     dbeta_nl = np.full(rho.size, np.nan)
     ok = np.flatnonzero(~(normal | no_root))
     dbeta_nl[ok] = problem.subset(ok).soliton_term(rho[ok], order[ok])
+    # A term that is finite in the solve but not at the solved density: masked too.
+    late = ok[~np.isfinite(dbeta_nl[ok])]
+    no_root[late] = True
+    rho[late] = np.nan
+    beta2[late] = gamma[late] = order[late] = np.nan
     with np.errstate(invalid="ignore"):
         no_soliton = order <= 0.5
     return Solved(

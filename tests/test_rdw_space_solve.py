@@ -311,3 +311,68 @@ def test_rejects_gas_without_zero_dispersion_density(helium):
     anomalous_gas = dataclasses.replace(helium, g2=-helium.g2)
     with pytest.raises(ValueError, match="g2"):
         solve_rho(anomalous_gas, np.array([1e-4]), np.array([1e-4]), FWHM)
+
+
+def _half_order_energy(constants, radius):
+    """Return the energy at which N(rho_lin) = 1/2 exactly, in J."""
+    rho = _linear(constants, radius)
+    t0 = pulse_width(FWHM, "sech")
+    beta2 = rho * constants.g2 - constants.w2 / radius**2
+    gamma = rho * constants.n2_0 * OMEGA_PUMP / (C * constants.aeff0 * radius**2)
+    return 2.0 * t0 * abs(beta2) / (4.0 * gamma * t0**2)
+
+
+@pytest.mark.parametrize("span", [1e-6, 1e-3])
+def test_no_rounding_no_root_across_half_order(helium, span):
+    """Energies straddling N = 1/2 always solve: a mask never comes from rounding.
+
+    Just above N = 1/2 the term is at the rounding floor of ``dbeta_rho -
+    target/rho``; the secant slope there is noise and must not be read as no root.
+    """
+    a = np.array([100e-6])
+    energy = _half_order_energy(helium, a[0]) * (1.0 + np.linspace(-span, span, 20001))
+    solved = solve_rho(helium, a, energy, FWHM)
+    assert not np.any(solved.no_root)
+    assert np.all(solved.ok)
+    np.testing.assert_allclose(
+        solved.rho[:, 0], _linear(helium, a[0]), rtol=1e-6 if span > 1e-5 else 1e-12
+    )
+
+
+def test_non_finite_term_is_masked_no_root(helium):
+    """A term that returns NaN masks its points as no_root, never ok."""
+
+    def broken(*, gamma, p_largest, omega_target, omega_pump):
+        return np.where(p_largest > 0, np.nan, 0.0) + 0.0 * gamma
+
+    a = np.array([100e-6])
+    energy = np.array([1e-7, 1e-4, 1e-3])
+    solved = solve_rho(helium, a, energy, FWHM, term=broken)
+    # N <= 1/2 at 0.1 uJ: the term is a finite zero there, so that point solves.
+    assert solved.ok[0, 0]
+    assert np.all(solved.no_root[1:, 0])
+    assert not np.any(solved.ok[1:, 0])
+    assert np.all(np.isnan(solved.rho[1:, 0]))
+
+
+def test_term_nan_everywhere_masks_every_point(helium):
+    def nan_term(*, gamma, p_largest, omega_target, omega_pump):
+        return np.full_like(gamma * p_largest, np.nan)
+
+    solved = solve_rho(
+        helium, np.array([100e-6]), np.array([1e-7, 1e-3]), FWHM, term=nan_term
+    )
+    assert np.all(solved.no_root)
+    assert not np.any(solved.ok)
+
+
+@pytest.mark.parametrize("field", ["n2_0", "dbeta_wg", "g2", "aeff0"])
+def test_rejects_non_finite_constants(helium, field):
+    broken = dataclasses.replace(helium, **{field: math.nan})
+    with pytest.raises(ValueError, match=field):
+        solve_rho(broken, np.array([1e-4]), np.array([1e-4]), FWHM)
+
+
+def test_rejects_nan_energy(helium):
+    with pytest.raises(ValueError, match="energy must"):
+        solve_rho(helium, np.array([1e-4]), np.array([1e-4, np.nan]), FWHM)
