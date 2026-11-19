@@ -23,21 +23,8 @@ The fibre mode is taken as a Gaussian beam of waist ``w0 = 0.64 a`` at the fibre
 whose 1/e^2 radius at distance ``d`` is ``w(d) = w0 sqrt(1 + (d / z_R)^2)`` with
 ``z_R = pi w0^2 / lambda``. The pulse is a sech of peak power ``E / (2 T0)``.
 
-When thickness and aperture both vary, HiSol finds the distance where the largest
-thickness the nonlinearity allows, ``t_NL(d) = A (1 + d^2/z_R(lambda_ref)^2)``, meets
-the smallest thickness that holds the pressure, ``t_P(d) = B sqrt(1 + d^2 /
-z_R(lambda_max)^2)``, with a root find. Writing ``r = A / B``, ``u = (d /
-z_R(lambda_ref))^2`` and ``kappa = (lambda_max / lambda_ref)^2``, squaring
-``r (1 + u) = sqrt(1 + kappa u)`` gives
-
-.. math::
-   r^2 u^2 + (2 r^2 - \kappa) u - (1 - r^2) = 0 .
-
-If ``r > 1`` the window can sit at the fibre end (``d = 0``, HiSol's rule). Otherwise
-the constant term is not positive, so the two roots have opposite signs (or one is
-zero) and the crossing is the non-negative root; squaring adds no other root because
-both sides are positive. This closed form replaces HiSol's ``find_zero`` (suggested in
-HiSol's ``performance_plan.md``, item R8b).
+The window formulas, and the closed form that replaces HiSol's root find for a
+variable window, are in :mod:`._window`.
 
 Points where no window exists give an infinite distance; nothing here raises for a
 grid point.
@@ -49,11 +36,15 @@ from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
-from jaxtyping import Bool, Float
+from jaxtyping import Float
 from numpy.typing import ArrayLike
 
 from solprop.physdata import SilicaBundle
-from solprop.tools.pulse import pulse_width
+from solprop.tools.rdw_space._window import (
+    diverged_beam,
+    mirror_distance,
+    window_details,
+)
 
 __all__ = [
     "Constraint",
@@ -61,19 +52,12 @@ __all__ = [
     "FixedConstraint",
     "NoConstraint",
     "WindowConstraint",
+    "WindowPreset",
     "details",
     "distance",
     "window_materials",
+    "window_presets",
 ]
-
-# Gaussian waist of the fibre mode over the core radius (HiSol: ``w0 = 0.64a``).
-_WAIST_RATIO: Final = 0.64
-# Largest aperture radius HiSol searches for a variable window, m.
-_MAX_APERTURE_RADIUS: Final = 50e-3
-# Iterations HiSol allows the rounding of a variable window to settle.
-_ROUNDING_ITERATIONS: Final = 20
-# HiSol's slack in its final consistency checks (Julia ``eps(Float64)``), m.
-_EPS: Final = float(np.finfo(float).eps)
 
 
 def _silica_n2(wavelength: float) -> float:
@@ -98,7 +82,8 @@ def window_materials() -> tuple[str, ...]:
     tuple of str
         Material names for which solprop's physdata has both a nonlinear index and an
         elastic limit, sorted. Empty while physdata holds no elastic limit; a
-        :class:`WindowConstraint` then takes both numbers explicitly.
+        :class:`WindowConstraint` then takes both numbers explicitly, for example from
+        :func:`window_presets` (HiSol's numbers, not solprop data).
 
     Examples
     --------
@@ -107,6 +92,87 @@ def window_materials() -> tuple[str, ...]:
     False
     """
     return tuple(sorted(set(_N2_SOURCES) & set(_ELASTIC_LIMIT_SOURCES)))
+
+
+@dataclass(frozen=True)
+class WindowPreset:
+    """A window material's numbers as transcribed from HiSol, for a prototype.
+
+    Attributes
+    ----------
+    n2 : float
+        Nonlinear index in m^2/W.
+    elastic_limit : float
+        Elastic limit (modulus of rupture) in Pa.
+    source : str
+        Where the numbers come from.
+    """
+
+    n2: float
+    elastic_limit: float
+    source: str
+
+
+_HISOL = (
+    "transcribed from HiSol Data.jl (branch new-constraints: n2_solid, "
+    "elastic_limit); prototype only, not verified against the primary source"
+)
+_CRYSTRAN = (
+    "elastic limit: Crystran, design of pressure windows datasheet "
+    "(https://www.crystran.co.uk/media/wysiwyg/Datasheets/design-of-pressure-windows_1.pdf)"
+    ", as cited by HiSol"
+)
+_PRESETS: Final[dict[str, WindowPreset]] = {
+    "SiO2": WindowPreset(
+        2.6e-20,
+        55e6,
+        f"{_HISOL}; n2: no citation in HiSol (solprop's own SiO2 n2 is 2.587e-20 "
+        f"m^2/W at 800 nm, HiSol's 2.6e-20); {_CRYSTRAN}",
+    ),
+    "MgF2": WindowPreset(
+        5.79e-21,
+        49.6e6,
+        f"{_HISOL}; n2: R. DeSalvo et al., IEEE J. Q. Elec. 32, 10 (1996), as cited "
+        f"by HiSol; {_CRYSTRAN}",
+    ),
+    "CaF2": WindowPreset(
+        1.8e-20,
+        36.5e6,
+        f"{_HISOL}; n2: Ensley, Optics Express Vol. 27, No. 26 (23 December 2019), "
+        f"as cited by HiSol; {_CRYSTRAN}",
+    ),
+}
+
+
+def window_presets() -> dict[str, WindowPreset]:
+    """Return window materials with numbers transcribed from HiSol, for a prototype.
+
+    These are **not** solprop data. Each preset is transcribed from HiSol's ``Data.jl``
+    (branch ``new-constraints``, ``n2_solid`` and ``elastic_limit``) for the materials
+    HiSol has both numbers for, with the citation HiSol's comments give; they are for
+    the prototype only and are not verified against the primary sources. Pass a
+    preset's numbers to :class:`WindowConstraint` (``material=preset.n2``,
+    ``elastic_limit=preset.elastic_limit``). HiSol's SiO2 n2 is 2.6e-20 m^2/W; solprop's
+    own (physdata, optmat's silica Kerr fit) is 2.587e-20 m^2/W at 800 nm.
+
+    :func:`window_materials`, in contrast, lists the materials for which solprop's
+    physdata itself has n2 and an elastic limit, which can be given to
+    :class:`WindowConstraint` by name; it is empty while physdata has no elastic limit.
+
+    Returns
+    -------
+    dict of str to WindowPreset
+        Material name to its HiSol numbers and their source (a fresh copy).
+
+    Examples
+    --------
+    >>> from solprop.tools.rdw_space import WindowConstraint, window_presets
+    >>> sorted(window_presets())
+    ['CaF2', 'MgF2', 'SiO2']
+    >>> silica = window_presets()["SiO2"]
+    >>> window = WindowConstraint(800e-9, silica.n2, elastic_limit=silica.elastic_limit)
+    """
+    return dict(_PRESETS)
 
 
 def _check_positive(owner: str, name: str, value: float) -> None:
@@ -357,258 +423,6 @@ class WindowConstraint:
 
 type Constraint = NoConstraint | FixedConstraint | DamageConstraint | WindowConstraint
 
-type _Array = Float[np.ndarray, "..."]
-
-
-# ------------------------------------------------------------------ HiSol's formulas
-
-
-def _rayleigh(w0: _Array, wavelength: float) -> _Array:
-    """Return the Rayleigh range of waist `w0` (HiSol ``rayleigh``)."""
-    return np.pi * w0**2 / wavelength
-
-
-def _diverged_beam(a: _Array, wavelength: float, d: _Array) -> _Array:
-    """Return the 1/e^2 radius at `d` from the fibre end (HiSol ``diverged_beam``)."""
-    w0 = _WAIST_RATIO * a
-    return w0 * np.sqrt(1 + (d / _rayleigh(w0, wavelength)) ** 2)
-
-
-def _beamsize_distance(w0: _Array, wavelength: float, w: _Array) -> _Array:
-    """Return where the beam reaches radius `w`, NaN below the waist.
-
-    HiSol ``beamsize_distance``.
-    """
-    with np.errstate(invalid="ignore"):
-        return _rayleigh(w0, wavelength) * np.sqrt((w / w0) ** 2 - 1)
-
-
-def _thickness_breaking(
-    dp_bar: _Array, radius: _Array, elastic_limit: float, s_break: float
-) -> _Array:
-    """Return the thickness that holds `dp_bar` (HiSol ``window_thickness_breaking``).
-
-    An unclamped circular window, as HiSol: ``1.06 r sqrt(S dP / elastic limit)``.
-    """
-    return 1.06 * radius * np.sqrt(s_break * dp_bar * 1e5 / elastic_limit)
-
-
-def _mirror_distance(
-    a: _Array, wavelength: float, energy: _Array, lidt: float, s_fluence: float
-) -> _Array:
-    """Return the distance below the damage fluence (HiSol ``mirror_distance``)."""
-    w0 = _WAIST_RATIO * a
-    z_r = _rayleigh(w0, wavelength)
-    max_fluence = lidt / s_fluence
-    return np.sqrt(2 * energy * z_r**2 / (np.pi * w0**2 * max_fluence))
-
-
-def _max_aperture_distance(
-    a: _Array, wavelength_max: float, aperture: float, factor: float
-) -> _Array:
-    """Return the farthest distance the beam fits a fixed aperture, -inf if never.
-
-    HiSol ``_max_aperture_distance``.
-    """
-    w0 = _WAIST_RATIO * a
-    fits = aperture > factor * w0
-    w = np.where(fits, aperture / factor, 2 * w0)
-    return np.where(fits, _beamsize_distance(w0, wavelength_max, w), -np.inf)
-
-
-def _round_up(value: _Array, step_mm: bool | float) -> _Array:
-    """Round up to a multiple of `step_mm` mm (HiSol ``needround``/``rounding``)."""
-    step = 1e-3 * (1.0 if step_mm is True else float(step_mm))
-    return np.ceil(value / step) * step
-
-
-# --------------------------------------------------------------------- the window
-
-
-@dataclass(frozen=True)
-class _Window:
-    """The numbers of one window evaluation, broadcast to the grid."""
-
-    c: WindowConstraint
-    a: _Array
-    power: _Array
-    dp: _Array
-    n2: float
-    elastic: float
-    wavelength_max: float
-
-    def window_distance(self, thickness: _Array) -> _Array:
-        """Return the distance that keeps the B-integral of `thickness` below b_max.
-
-        HiSol ``window_distance``.
-        """
-        wavelength = self.c.wavelength_ref
-        k0 = 2 * np.pi / wavelength
-        i_max = self.c.b_max / (self.n2 * k0 * thickness)
-        w0_min = np.sqrt(2 * self.power / (np.pi * i_max))
-        w0 = _WAIST_RATIO * self.a
-        far = w0 < w0_min
-        w = np.where(far, w0_min, w0)
-        return np.where(far, _beamsize_distance(w0, wavelength, w), 0.0)
-
-    def t_nl(self, d: _Array) -> _Array:
-        """Return the largest thickness the nonlinearity allows at `d`.
-
-        HiSol ``window_thickness_nonlinear``.
-        """
-        wavelength = self.c.wavelength_ref
-        k0 = 2 * np.pi / wavelength
-        w = _diverged_beam(self.a, wavelength, d)
-        intensity = 2 * self.power / (np.pi * w**2)
-        return self.c.b_max / (self.n2 * k0 * intensity)
-
-    def t_p(self, aperture: _Array) -> _Array:
-        """Return the smallest thickness that holds the pressure over `aperture`."""
-        return _thickness_breaking(self.dp, aperture, self.elastic, self.c.s_break)
-
-    def min_aperture(self, d: _Array) -> _Array:
-        """Return the smallest aperture radius that passes the beam at `d`."""
-        w = _diverged_beam(self.a, self.wavelength_max, d)
-        return self.c.aperture_factor * w
-
-
-def _crossing(w: _Window) -> _Array:
-    """Return the distance where ``t_NL(d) = t_P(d)``, the closed form of the module.
-
-    HiSol finds it with ``find_zero`` in ``window_distance_thickness_aperture``; both
-    give ``d = 0`` when the nonlinear limit is already the larger at the fibre end.
-    """
-    c = w.c
-    zero = np.zeros_like(w.a)
-    r = w.t_nl(zero) / w.t_p(w.min_aperture(zero))
-    kappa = (w.wavelength_max / c.wavelength_ref) ** 2
-    r2 = r**2
-    beta = 2 * r2 - kappa
-    gap = 1 - r2  # minus the constant term, >= 0 where a root is wanted
-    with np.errstate(invalid="ignore", divide="ignore"):
-        root = np.sqrt(beta**2 + 4 * r2 * gap)
-        # The non-negative root, in the form that does not cancel.
-        u = np.where(beta > 0, 2 * gap / (beta + root), (root - beta) / (2 * r2))
-        d = _rayleigh(_WAIST_RATIO * w.a, c.wavelength_ref) * np.sqrt(u)
-    return np.where(r > 1, 0.0, d)
-
-
-def _settle(
-    w: _Window, thickness: _Array, aperture: _Array, d: _Array
-) -> tuple[_Array, _Array, _Array, Bool[np.ndarray, "..."]]:
-    """Round a variable window up as HiSol's fixed-point loops; also flag failures."""
-    c = w.c
-    rt, ra = c.round_thickness, c.round_aperture
-    active = np.ones(w.a.shape, dtype=bool)
-    for _ in range(_ROUNDING_ITERATIONS):
-        if rt is not False and ra is not False:
-            aperture = np.where(active, _round_up(aperture, ra), aperture)
-            new_t = _round_up(np.maximum(w.t_p(aperture), thickness), rt)
-            thickness = np.where(active, new_t, thickness)
-            d = np.where(active, w.window_distance(thickness), d)
-            target = w.min_aperture(d)
-            active &= ~(aperture >= target)
-            aperture = np.where(active, target, aperture)
-        elif rt is not False:
-            thickness = np.where(active, _round_up(thickness, rt), thickness)
-            d = np.where(active, w.window_distance(thickness), d)
-            aperture = np.where(active, w.min_aperture(d), aperture)
-            target = w.t_p(aperture)
-            active &= ~(thickness >= target)
-            thickness = np.where(active, target, thickness)
-        else:
-            aperture = np.where(active, _round_up(aperture, ra), aperture)
-            thickness = np.where(active, w.t_p(aperture), thickness)
-            d = np.where(active, w.window_distance(thickness), d)
-            target = w.min_aperture(d)
-            active &= ~(aperture >= target)
-            aperture = np.where(active, target, aperture)
-        if not active.any():
-            break
-    return thickness, aperture, d, active
-
-
-def _variable_window(w: _Window) -> tuple[_Array, _Array, _Array]:
-    """Both thickness and aperture variable.
-
-    HiSol ``window_distance_thickness_aperture``.
-    """
-    c = w.c
-    d = _crossing(w)
-    w0 = _WAIST_RATIO * w.a
-    max_d = _beamsize_distance(
-        w0,
-        w.wavelength_max,
-        np.full_like(w0, _MAX_APERTURE_RADIUS / c.aperture_factor),
-    )
-    failed = d > max_d
-    thickness = w.t_nl(d)
-    aperture = w.min_aperture(d)
-    if c.round_thickness is not False or c.round_aperture is not False:
-        thickness, aperture, d, unsettled = _settle(w, thickness, aperture, d)
-        failed |= unsettled
-    # HiSol's final checks: thin enough, thick enough, aperture large enough.
-    failed |= thickness > w.t_nl(d) + _EPS
-    failed |= thickness < w.t_p(aperture) - _EPS
-    failed |= aperture < w.min_aperture(d) - _EPS
-    return (
-        np.where(failed, np.inf, d),
-        np.where(failed, np.inf, thickness),
-        np.where(failed, np.inf, aperture),
-    )
-
-
-def _window_details(
-    c: WindowConstraint, a: _Array, energy: _Array, fwhm: _Array, pressure: _Array
-) -> dict[str, _Array]:
-    """HiSol ``details(::WindowConstraint)``, vectorised."""
-    energy = energy * c.conversion
-    if c.fwhm_override is not None:
-        fwhm = np.full_like(fwhm, c.fwhm_override)
-    w = _Window(
-        c,
-        a,
-        energy / (2 * fwhm * pulse_width(1.0, "sech")),  # HiSol Solitons.T0P0, sech
-        np.maximum(pressure - 1, 1),  # HiSol: "make sure we can handle vacuum"
-        c.n2(),
-        c.elastic_limit_pa(),
-        c.wavelength_max or c.wavelength_ref,  # filled in by __post_init__
-    )
-    if c.thickness is None and c.aperture_radius is None:
-        d, thickness, aperture = _variable_window(w)
-    elif c.aperture_radius is None:
-        thickness = np.full_like(a, c.thickness)
-        d = w.window_distance(thickness)
-        aperture = w.min_aperture(d)
-        if c.round_aperture is not False:
-            aperture = _round_up(aperture, c.round_aperture)
-        d = np.where(thickness < w.t_p(aperture), np.inf, d)
-    else:
-        aperture = np.full_like(a, c.aperture_radius)
-        max_d = _max_aperture_distance(
-            a, w.wavelength_max, c.aperture_radius, c.aperture_factor
-        )
-        if c.thickness is None:
-            thickness = w.t_p(aperture)
-            if c.round_thickness is not False:
-                thickness = _round_up(thickness, c.round_thickness)
-            d = w.window_distance(thickness)
-            d = np.where(d > max_d, np.inf, d)
-        else:
-            thickness = np.full_like(a, c.thickness)
-            d = w.window_distance(thickness)
-            d = np.where((thickness < w.t_p(aperture)) | (d > max_d), np.inf, d)
-    if c.lidt is not None:
-        d = np.maximum(
-            d, _mirror_distance(a, c.wavelength_ref, energy, c.lidt, c.s_fluence)
-        )
-    return {
-        "distance": d,
-        "thickness": thickness,
-        "aperture_radius": aperture,
-        "beam_radius": _diverged_beam(a, c.wavelength_ref, d),
-    }
-
 
 # -------------------------------------------------------------------- public entry
 
@@ -672,18 +486,18 @@ def details(
         case FixedConstraint():
             out = {"distance": zeros + constraint.distance}
         case DamageConstraint():
-            d = _mirror_distance(
+            d = mirror_distance(
                 a_,
                 constraint.wavelength_ref,
                 energy_ * constraint.conversion,
                 constraint.lidt,
                 constraint.s_fluence,
             )
-            beam = _diverged_beam(a_, constraint.wavelength_ref, d)
+            beam = diverged_beam(a_, constraint.wavelength_ref, d)
             out = {"distance": d, "beam_radius": beam}
         case WindowConstraint():
             with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
-                out = _window_details(constraint, a_, energy_, fwhm_, pressure_)
+                out = window_details(constraint, a_, energy_, fwhm_, pressure_)
             bad = ~(
                 np.isfinite(a_)
                 & np.isfinite(energy_)

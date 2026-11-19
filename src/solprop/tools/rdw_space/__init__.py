@@ -10,9 +10,11 @@ from solprop.tools.rdw_space.constraints import (
     FixedConstraint,
     NoConstraint,
     WindowConstraint,
+    WindowPreset,
     details,
     distance,
     window_materials,
+    window_presets,
 )
 from solprop.tools.rdw_space.limits import (
     Ratios,
@@ -41,6 +43,7 @@ __all__ = [
     "SolitonTerm",
     "Solved",
     "WindowConstraint",
+    "WindowPreset",
     "details",
     "distance",
     "fission_length",
@@ -53,4 +56,5 @@ __all__ = [
     "solprop_half",
     "solve_rho",
     "window_materials",
+    "window_presets",
 ]

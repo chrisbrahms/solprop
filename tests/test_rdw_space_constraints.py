@@ -32,6 +32,7 @@ from solprop.tools.rdw_space import (
     details,
     distance,
     window_materials,
+    window_presets,
 )
 
 N2 = 2.6e-20
@@ -510,3 +511,23 @@ def test_invalid_parameters_name_the_field(build, field):
 
 def test_wavelength_max_defaults_to_the_reference():
     assert window(wavelength_max=None).wavelength_max == WL_REF
+
+
+def test_window_presets_are_labelled_hisol_numbers():
+    presets = window_presets()
+    assert set(presets) == {"SiO2", "MgF2", "CaF2"}
+    for preset in presets.values():
+        assert math.isfinite(preset.n2) and preset.n2 > 0
+        assert math.isfinite(preset.elastic_limit) and preset.elastic_limit > 0
+        assert "HiSol" in preset.source
+    # A preset is not solprop data: window_materials stays physdata-only.
+    assert not set(window_materials()) & {"MgF2", "CaF2"}
+
+
+def test_window_from_preset_reproduces_hisol():
+    silica = window_presets()["SiO2"]
+    constraint = WindowConstraint(
+        WL_REF, silica.n2, elastic_limit=silica.elastic_limit, wavelength_max=WL_MAX
+    )
+    # HiSol reference: both variable (HiSol's SiO2 numbers are the injected ones).
+    assert point(constraint)["distance"] == pytest.approx(4.601709113301356, rel=1e-12)
