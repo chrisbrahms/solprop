@@ -15,27 +15,15 @@ recomputes only the tiers that depend on it:
 3. maximum length, safety factors and constraints: the constraint distances, the
    available fibre length and the four ratios (:func:`.limits.ratios`).
 
-**Axes.** By default the axes follow HiSol ``Design.maxlength_limitratios``: energy
-``0.1 E_min .. 1.1 E_max`` (log: ``0.5 E_min .. 1.1 E_max``), radius ``0.9 a_min ..
-1.3 a_max``, with the corners from HiSol's closed forms in the *linear* limit (no
-soliton term, ``rho a^2`` fixed by the linear phase match): ``(E_min, a_min)`` is
-``Design.min_energy``, the loss limit at the maximum soliton order, and ``(E_max,
-a_max)`` is ``Design.max_energy``, the largest radius on the maximum-order line at
-which ``S_fiss L_fiss`` plus both constraint distances fits in the maximum length
-(``Design._solve_maximum_radius``). The soliton term can move the allowed region past
-these linear corners (with ``novoa_pr425`` in the He, 160 nm, 800 nm, 10 fs, 5 m case it
-reaches 1.44 mJ against an axis top of 1.16 mJ), so where the allowed region touches the
-top or right edge, that axis's upper end is raised by a factor 1.5 and tiers 2 and 3
-rerun, at most three times. Because the axes depend on tier-3 inputs, a change of those
-can move the axes and so rerun tier 2; :meth:`RdwSpace.compute` takes pinned axes to
-avoid that. If the length-limited corner does not exist (nothing fits, or it lies below
-``a_min``) the axes fall back to ``a_max = 2 a_min`` on the same maximum-order line, so
-``E_max = 4 E_min``, and ``region_empty`` is set; with normal dispersion at the pump
-(no corner at all) they fall back to HiSol's ``aplot_energy_maxlength`` radius defaults,
-10 to 350 um, and 1 uJ to 1 mJ.
+**Axes.** By default the axes follow HiSol ``Design.maxlength_limitratios``, with the
+corners from HiSol's closed forms in the linear limit (:mod:`._axes`). The soliton term
+can move the allowed region past these linear corners (with ``novoa_pr425`` in the He,
+160 nm, 800 nm, 10 fs, 5 m case it reaches 1.44 mJ against an axis top of 1.16 mJ), so
+:meth:`RdwSpace.compute` widens them (its docstring gives the rule). Because the axes
+depend on tier-3 inputs, a change of those can move the axes and so rerun tier 2;
+:meth:`RdwSpace.compute` takes pinned axes to avoid that.
 """
 
-import contextlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -43,13 +31,11 @@ from typing import Literal
 
 import numpy as np
 from jaxtyping import Bool, Float
-from scipy.optimize import brentq
 
 from solprop import physdata
-from solprop.constants import C
 from solprop.exceptions import MaterialError, NoZeroDispersionError
 from solprop.modes import MarcatiliMode, zdw
-from solprop.tools.pulse import pulse_width
+from solprop.tools.rdw_space._axes import auto_axes, span
 from solprop.tools.rdw_space.constants import (
     GasConstants,
     gas_constants,
@@ -78,11 +64,6 @@ __all__ = ["RdwSpace", "SpaceInputs", "SpaceResult"]
 # Critical power factor replacing 3 (Fibich and Gaeta, Opt. Lett. 25, 335 (2000)), as
 # HiSol Limits.jl ``critical_intensity``.
 _CRITICAL_POWER_FACTOR = 1.86225
-# HiSol ``_solve_maximum_radius``: coarse log scan of 65 radii from 1 um to 20 mm.
-_RADIUS_SCAN = np.logspace(math.log10(1e-6), math.log10(20e-3), 65)
-# Fallback axes with normal dispersion at the pump (HiSol aplot_energy_maxlength), m, J.
-_DEFAULT_RADII = (10e-6, 350e-6)
-_DEFAULT_ENERGIES = (1e-6, 1e-3)
 # Longest wavelength searched for the ZDW of a point, m (solprop's zdw default).
 _ZDW_LONGEST = 3e-6
 _MASK_NAMES = ("normal_dispersion", "no_root", "no_soliton")
@@ -175,7 +156,16 @@ class SpaceResult:
         ``normal_dispersion``, ``no_root`` and ``no_soliton`` from `solved`.
     region_empty : bool
         True when no grid point is allowed, or the linear length-limited corner does
-        not exist and the axes fell back (module docstring).
+        not exist and the automatic axes fell back.
+    eos_limited : bool
+        True when the automatic axes' corner scan met radii whose density lies past
+        the top of solprop's equation of state (window constraints only) and those
+        radii could have changed the outcome: no radius fitted, or the one just past
+        the largest fitting radius was such a radius. They are treated as not
+        fitting; HiSol would evaluate them with Luna's equation of state. So with
+        ``region_empty`` and ``eos_limited`` both true, the empty region may be an
+        artefact of that limit rather than of the physics. Always False with pinned
+        axes.
     computed_tiers : tuple of int
         The tiers this call ran, ``()`` for a repeated call.
     """
@@ -188,156 +178,8 @@ class SpaceResult:
     flength: Float[np.ndarray, "ne na"]
     masks: dict[str, Bool[np.ndarray, "ne na"]]
     region_empty: bool
+    eos_limited: bool
     computed_tiers: tuple[int, ...]
-
-
-def _no_term(
-    *,
-    gamma: Float[np.ndarray, "..."],
-    p_largest: Float[np.ndarray, "..."],  # noqa: ARG001
-    omega_target: float,  # noqa: ARG001
-    omega_pump: float,  # noqa: ARG001
-) -> Float[np.ndarray, "..."]:
-    """Return a zero soliton term: the linear phase match of HiSol."""
-    return np.zeros_like(gamma)
-
-
-@dataclass(frozen=True)
-class _Linear:
-    """The linear-limit numbers behind HiSol's corner estimates, all SI.
-
-    ``rho_a2`` is HiSol ``density_area_product`` (m^-1), ``delta`` is ``|Delta|`` of
-    HiSol ``HCF.Delta`` (s^2 m), ``gamma_h`` is ``gamma a^4`` of HiSol ``HCF.gamma``
-    with ``rhoasq`` (rad m^3/W), ``order_max`` is ``Limits.Nmax`` and ``anomalous``
-    says whether ``Delta < 0``.
-    """
-
-    t0: float
-    rho_a2: float
-    delta: float
-    gamma_h: float
-    order_max: float
-    anomalous: bool
-
-    def energy(self, order: float, a: np.ndarray | float) -> np.ndarray | float:
-        """Return the energy in J of soliton order `order` at radii `a` (m).
-
-        HiSol ``Solitons.N_to_energy`` (``rhoasq`` form): ``2 T0 N^2 |Delta| a^2 /
-        (T0^2 gamma)``.
-        """
-        return (
-            2.0 * self.t0 * order**2 * self.delta * a**2 / (self.t0**2 * self.gamma_h)
-        )
-
-    def fission_length(
-        self, a: np.ndarray | float, energy: np.ndarray | float
-    ) -> np.ndarray | float:
-        """Return ``sqrt(L_D L_NL)`` in m at radii `a` (m) and energies (J).
-
-        HiSol ``_solve_maximum_radius``: ``L_fiss = prefac a^3 / sqrt(P0)``.
-        """
-        p0 = energy / (2.0 * self.t0)
-        return np.sqrt(self.t0**2 * a**2 / self.delta * a**4 / (self.gamma_h * p0))
-
-
-def _linear(c: GasConstants, inputs: SpaceInputs) -> _Linear:
-    """Return the linear-limit numbers; ``order_max`` reuses :func:`.limits.n_max`."""
-    t0 = pulse_width(inputs.fwhm, "sech")
-    rho_a2 = c.dbeta_wg / c.dbeta_rho
-    big_delta = rho_a2 * c.g2 - c.w2
-    omega_pump = 2.0 * math.pi * C / c.wavelength_pump
-    gamma_h = c.n2_0 * omega_pump * rho_a2 / (C * c.aeff0)
-    order_max = math.nan
-    if big_delta < 0.0:
-        # Any radius: with no soliton term the solve gives rho a^2 = rho_a2 exactly.
-        a = np.array([100e-6])
-        solved = solve_rho(c, a, np.array([1e-6]), inputs.fwhm, term=_no_term)
-        order_max = float(
-            n_max(c, solved, a, s_sf=inputs.s_sf, s_ion=inputs.s_ion)[0, 0]
-        )
-    return _Linear(t0, rho_a2, abs(big_delta), gamma_h, order_max, big_delta < 0.0)
-
-
-def _maximum_radius(
-    c: GasConstants,
-    inputs: SpaceInputs,
-    lin: _Linear,
-) -> float | None:
-    """Return the largest radius on the maximum-order line that fits, None if none does.
-
-    A port of HiSol ``Design._solve_maximum_radius``: ``max_length - S_fiss L_fiss -
-    d_in - d_out`` is scanned on 65 log-spaced radii from 1 um to 20 mm and its last
-    sign change refined with Brent's method. A point whose pressure lies outside the
-    equation of state (only a window needs it), or whose distance is not finite, does
-    not fit; for Brent's bracket its difference is ``-max_length``.
-    """
-    windows = any(
-        isinstance(k, WindowConstraint)
-        for k in (inputs.input_constraint, inputs.output_constraint)
-    )
-
-    def _difference(a: Float[np.ndarray, " n"]) -> Float[np.ndarray, " n"]:
-        energy = lin.energy(lin.order_max, a)
-        pressure = np.full(a.shape, np.nan)
-        if windows:
-            for i, rho in enumerate(lin.rho_a2 / a**2):
-                with contextlib.suppress(MaterialError):
-                    pressure[i] = physdata.pressure(c.gas, float(rho))
-        d_in = distance(inputs.input_constraint, a, energy, inputs.fwhm, pressure)
-        d_out = distance(inputs.output_constraint, a, energy, inputs.fwhm, pressure)
-        diff = inputs.max_length - inputs.s_fiss * lin.fission_length(a, energy)
-        diff = diff - d_in - d_out
-        return np.where(np.isfinite(diff), diff, -inputs.max_length)
-
-    scan = _difference(_RADIUS_SCAN)
-    fits = np.flatnonzero(scan > 0.0)
-    if fits.size == 0:
-        return None
-    last = int(fits[-1])
-    if last == _RADIUS_SCAN.size - 1:
-        return float(_RADIUS_SCAN[-1])
-    return float(
-        brentq(
-            lambda x: float(_difference(np.array([x]))[0]),
-            _RADIUS_SCAN[last],
-            _RADIUS_SCAN[last + 1],
-            xtol=1e-15,
-            rtol=1e-12,
-        )
-    )
-
-
-def _auto_axes(
-    c: GasConstants, inputs: SpaceInputs, points: int
-) -> tuple[Float[np.ndarray, " na"], Float[np.ndarray, " ne"], bool]:
-    """Return HiSol's axes from the linear corners, and whether they fell back."""
-    lin = _linear(c, inputs)
-    if not lin.anomalous:
-        a_lo, a_hi = _DEFAULT_RADII
-        e_lo, e_hi = _DEFAULT_ENERGIES
-        return (
-            _span(a_lo, a_hi, points, log=inputs.log_a),
-            _span(e_lo, e_hi, points, log=inputs.log_e),
-            True,
-        )
-    # HiSol Design.min_energy: a = S_loss T0^2 / (N |delta| Lbar), Lbar = 1/alphabar.
-    a_min = inputs.s_loss * lin.t0**2 * c.alpha_bar / (lin.order_max * lin.delta)
-    e_min = float(lin.energy(lin.order_max, a_min))
-    # HiSol Design.max_energy: the largest radius on the maximum-order line that fits.
-    found = _maximum_radius(c, inputs, lin)
-    fallback = found is None or found <= a_min
-    a_max = 2.0 * a_min if found is None or fallback else found
-    e_max = float(lin.energy(lin.order_max, a_max))
-    e_lo = 0.5 * e_min if inputs.log_e else 0.1 * e_min
-    a_axis = _span(0.9 * a_min, 1.3 * a_max, points, log=inputs.log_a)
-    return a_axis, _span(e_lo, 1.1 * e_max, points, log=inputs.log_e), fallback
-
-
-def _span(lo: float, hi: float, points: int, *, log: bool) -> Float[np.ndarray, " n"]:
-    """Return `points` values from `lo` to `hi`, evenly or log-spaced."""
-    if log:
-        return np.logspace(math.log10(lo), math.log10(hi), points)
-    return np.linspace(lo, hi, points)
 
 
 def _finite_or_none(value: float | np.ndarray) -> float | None:
@@ -434,8 +276,14 @@ class RdwSpace:
             Grid points per axis, >= 2 (ignored with `axes`).
         axes : tuple of numpy.ndarray, optional
             Pinned ``(a, energy)`` axes in m and J (1-D, finite, positive). Default
-            ``None``: HiSol's axes from the linear corners (module docstring), which
-            depend on every input, so that a tier-3 change can move them.
+            ``None``: HiSol's axes from the linear corners (:mod:`._axes`), which
+            depend on every input, so that a tier-3 change can move them. Where the
+            allowed region then touches the top (largest-energy) row or the right
+            (largest-radius) column, that axis's upper end is multiplied by 1.5,
+            keeping its lower end and point count, and tiers 2 and 3 rerun; this
+            repeats at most three times, so the region can still touch an edge
+            afterwards. The widened axes are cached against the initial ones, so a
+            repeated call reruns nothing.
 
         Returns
         -------
@@ -456,14 +304,14 @@ class RdwSpace:
                 np.asarray(axes[0], dtype=float),
                 np.asarray(axes[1], dtype=float),
             )
-            return self._run(c, inputs, pinned, fallback=False, tiers=tiers)
-        a, energy, fallback = _auto_axes(c, inputs, points)
+            return self._run(c, inputs, pinned, flags=(False, False), tiers=tiers)
+        auto = auto_axes(c, inputs, points)
+        a, energy = auto.a, auto.energy
+        flags = (auto.fallback, auto.eos_limited)
         start = (a.tobytes(), energy.tobytes())
         if self._widened is not None and self._widened[0] == start:
-            return self._run(
-                c, inputs, self._widened[1], fallback=fallback, tiers=tiers
-            )
-        result = self._run(c, inputs, (a, energy), fallback=fallback, tiers=tiers)
+            return self._run(c, inputs, self._widened[1], flags=flags, tiers=tiers)
+        result = self._run(c, inputs, (a, energy), flags=flags, tiers=tiers)
         # Widen an axis whose far edge the allowed region touches (the soliton term can
         # move the region past HiSol's linear corners), by half its top value, at most
         # _WIDEN_PASSES times; the mapping is cached so a repeat call reruns nothing.
@@ -473,10 +321,10 @@ class RdwSpace:
             if not (right or top):
                 break
             if right:
-                a = _span(a[0], _WIDEN * a[-1], points, log=inputs.log_a)
+                a = span(a[0], _WIDEN * a[-1], points, log=inputs.log_a)
             if top:
-                energy = _span(energy[0], _WIDEN * energy[-1], points, log=inputs.log_e)
-            result = self._run(c, inputs, (a, energy), fallback=fallback, tiers=tiers)
+                energy = span(energy[0], _WIDEN * energy[-1], points, log=inputs.log_e)
+            result = self._run(c, inputs, (a, energy), flags=flags, tiers=tiers)
         self._widened = (start, (a, energy))
         return result
 
@@ -486,11 +334,15 @@ class RdwSpace:
         inputs: SpaceInputs,
         axes: tuple[np.ndarray, np.ndarray],
         *,
-        fallback: bool,
+        flags: tuple[bool, bool],
         tiers: list[int],
     ) -> SpaceResult:
-        """Run tiers 2 (if its key changed) and 3 on fixed axes; `tiers` collects."""
+        """Run tiers 2 (if its key changed) and 3 on fixed axes; `tiers` collects.
+
+        ``flags`` are the axes' ``(fallback, eos_limited)``.
+        """
         a, energy = axes
+        fallback, eos_limited = flags
         assert self._tier1 is not None
         key2 = (self._tier1[0], inputs.fwhm, a.tobytes(), energy.tobytes(), self._term)
         if self._tier2 is None or self._tier2[0] != key2:
@@ -530,6 +382,7 @@ class RdwSpace:
             flength=flength,
             masks={name: getattr(solved, name) for name in _MASK_NAMES},
             region_empty=fallback or not bool(result_ratios.allowed.any()),
+            eos_limited=eos_limited,
             computed_tiers=(*sorted(set(tiers)), 3),
         )
         self._last = (key3, result)

@@ -16,9 +16,11 @@ from solprop.tools.rdw_space import (
     FixedConstraint,
     RdwSpace,
     SpaceInputs,
+    WindowConstraint,
     novoa_pr425,
     ratios,
     solve_rho,
+    window_presets,
 )
 from solprop.tools.rdw_space import space as space_module
 from solprop.tools.rdw_space.constants import gas_constants, pressure_table
@@ -332,3 +334,45 @@ def test_auto_axes_widen_where_the_soliton_term_moves_the_region():
     assert novoa.energy[-1] > linear.energy[-1]
     allowed = novoa.ratios.allowed
     assert not allowed[-1].any() and not allowed[:, -1].any()
+
+
+# ------------------------------------------------ axis fallbacks and EOS flag
+
+
+def test_normal_dispersion_falls_back_to_default_axes(monkeypatch):
+    real = space_module.gas_constants
+
+    def _normal(*args, **kwargs):
+        # Twenty times the gas dispersion puts the zero-dispersion density below the
+        # linear phase-matching density: beta2 >= 0 at every radius.
+        constants = real(*args, **kwargs)
+        return replace(constants, g2=100.0 * constants.g2)
+
+    monkeypatch.setattr(space_module, "gas_constants", _normal)
+    result = RdwSpace().compute(_inputs(), 16)
+    # HiSol aplot_energy_maxlength radii, and 1 uJ to 1 mJ.
+    np.testing.assert_allclose([result.a[0], result.a[-1]], [10e-6, 350e-6])
+    np.testing.assert_allclose([result.energy[0], result.energy[-1]], [1e-6, 1e-3])
+    assert result.masks["normal_dispersion"].all()
+    assert result.region_empty
+    assert not result.eos_limited
+    assert not result.ratios.allowed.any()
+
+
+def test_eos_limited_flags_a_corner_scan_cut_by_the_equation_of_state():
+    silica = window_presets()["SiO2"]
+    window = WindowConstraint(800e-9, silica.n2, elastic_limit=silica.elastic_limit)
+    space = RdwSpace()
+    # A window fits: the scan's outcome is set far from the EOS limit (about 1.6 um).
+    fitting = space.compute(_inputs(input_constraint=window), 16)
+    assert not fitting.region_empty and not fitting.eos_limited
+    # Nothing fits, and the smallest radii were never evaluated: flagged.
+    crowded = _inputs(input_constraint=window, output_constraint=FixedConstraint(5.5))
+    blocked = space.compute(crowded, 16)
+    assert blocked.region_empty and blocked.eos_limited
+    # Nothing fits without a window: every radius was evaluated, so not flagged.
+    plain = space.compute(_inputs(output_constraint=FixedConstraint(5.5)), 16)
+    assert plain.region_empty and not plain.eos_limited
+    # Pinned axes never run the scan.
+    pinned = space.compute(crowded, 16, axes=(fitting.a, fitting.energy))
+    assert not pinned.eos_limited
