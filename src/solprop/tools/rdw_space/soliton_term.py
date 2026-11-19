@@ -11,7 +11,7 @@ coefficient ``gamma`` and the peak power ``p_largest`` of the largest soliton
 constituent, and returns the wavenumber (1/m) that the phase mismatch subtracts.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 from jaxtyping import Float
@@ -61,6 +61,7 @@ def largest_constituent_power(
     return np.where(has_soliton, p0 * ((2.0 * safe - 1.0) / safe) ** 2, 0.0)
 
 
+@runtime_checkable
 class SolitonTerm(Protocol):
     """A convention for the soliton's nonlinear wavenumber."""
 
