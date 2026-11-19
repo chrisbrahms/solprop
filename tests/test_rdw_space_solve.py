@@ -80,6 +80,26 @@ def test_zero_term_gives_linear_density(helium):
     np.testing.assert_allclose(solved.rho, expected, rtol=1e-12)
 
 
+def _assert_phase_matched(constants, a, solved, i, j):
+    """Assert solprop's own phase_mismatch vanishes at a solved grid point."""
+    rho = float(solved.rho[i, j])
+    radius = float(a[j])
+    mode = MarcatiliMode(radius, GAS, physdata.pressure(GAS, rho), model="reduced")
+    gamma = nonlinear_coefficient(mode, rho * constants.n2_0, WAVELENGTH_PUMP)
+    assert gamma == pytest.approx(float(solved.gamma[i, j]), rel=1e-6)
+    mismatch = phase_mismatch(
+        mode,
+        np.array([OMEGA_TARGET]),
+        WAVELENGTH_PUMP,
+        peak_power=float(solved.p0[i, j]),
+        gamma=gamma,
+        fwhm=FWHM,
+        shape="sech",
+        nonlinear_phase="largest",
+    )
+    assert abs(float(mismatch[0])) < 1e-6 * constants.dbeta_wg / radius**2
+
+
 def test_solved_density_zeroes_solprop_phase_mismatch(helium):
     """(b) A real reduced Marcatili mode at the solved density is phase-matched."""
     a = np.linspace(60e-6, 200e-6, 5)
@@ -88,24 +108,7 @@ def test_solved_density_zeroes_solprop_phase_mismatch(helium):
     checked = solved.ok & ~solved.no_soliton
     assert checked.sum() >= 15
     for i, j in zip(*np.nonzero(checked), strict=True):
-        rho = float(solved.rho[i, j])
-        radius = float(a[j])
-        mode = MarcatiliMode(radius, GAS, physdata.pressure(GAS, rho), model="reduced")
-        # The solver's Kerr index, n2 = rho n2_0, so the soliton term is the same one.
-        gamma = nonlinear_coefficient(mode, rho * helium.n2_0, WAVELENGTH_PUMP)
-        assert gamma == pytest.approx(float(solved.gamma[i, j]), rel=1e-6)
-        mismatch = phase_mismatch(
-            mode,
-            np.array([OMEGA_TARGET]),
-            WAVELENGTH_PUMP,
-            peak_power=float(solved.p0[i, j]),
-            gamma=gamma,
-            fwhm=FWHM,
-            shape="sech",
-            nonlinear_phase="largest",
-        )
-        scale = helium.dbeta_wg / radius**2
-        assert abs(float(mismatch[0])) < 1e-6 * scale
+        _assert_phase_matched(helium, a, solved, i, j)
 
 
 def test_residual_below_tolerance_where_solved(helium):
@@ -169,9 +172,24 @@ def test_no_root_at_huge_energy(helium):
     assert solved.no_root[1, 0]
     assert not solved.normal_dispersion[1, 0]
     assert np.isnan(solved.rho[1, 0])
-    # Independent check: F < 0 at every density up to three times the linear one.
-    rho = np.linspace(1e-3, 3.0, 4000) * _linear(helium, a[0])
+    # Independent check: F < 0 at every density up to the zero-dispersion one.
+    rho_zero = helium.w2 / helium.g2 / a[0] ** 2
+    rho = np.linspace(1e-3 * _linear(helium, a[0]), rho_zero, 4002)[:-1]
     assert np.all(_residual(helium, a[0], 1.0, rho) < 0)
+
+
+def test_root_far_above_linear_density_is_kept(helium):
+    """At 3 mJ the root lies near 7 rho_lin, below the ZDW: solved, not masked."""
+    a = np.array([100e-6])
+    energy = np.array([3e-3])
+    solved = solve_rho(helium, a, energy, FWHM)
+    assert solved.ok[0, 0]
+    ratio = float(solved.rho[0, 0]) / _linear(helium, a[0])
+    rho_zero = helium.w2 / helium.g2 / a[0] ** 2
+    assert ratio > 3.0
+    assert solved.rho[0, 0] < rho_zero
+    assert solved.beta2[0, 0] < 0
+    _assert_phase_matched(helium, a, solved, 0, 0)
 
 
 def test_no_root_with_an_overwhelming_term(helium):
@@ -286,3 +304,10 @@ def test_beta2_closed_form_matches_reduced_mode(helium, radius):
     got = rho * helium.g2 - helium.w2 / radius**2
     # g2 holds a central difference of gamma1'; 1e-4 is the agreed budget.
     assert got == pytest.approx(expected, rel=1e-4)
+
+
+def test_rejects_gas_without_zero_dispersion_density(helium):
+    """g2 <= 0 leaves no zero-dispersion density to bound the search."""
+    anomalous_gas = dataclasses.replace(helium, g2=-helium.g2)
+    with pytest.raises(ValueError, match="g2"):
+        solve_rho(anomalous_gas, np.array([1e-4]), np.array([1e-4]), FWHM)

@@ -53,7 +53,7 @@ is that of :math:`g_2\,\Delta\beta_{\rm wg}/\Delta\beta_\rho - w_2`, which does 
 depend on ``a`` or ``E``: for a gas and wavelength pair it is all or nothing, and it did
 not occur for any noble gas with a 120 to 600 nm target from an 800 nm pump.
 ``no_root``: anomalous at :math:`\rho_{\rm lin}`, but no root between
-:math:`\rho_{\rm lin}` and :math:`\min(3\rho_{\rm lin}, \rho_z)`. This includes the
+:math:`\rho_{\rm lin}` and :math:`\rho_z` (exclusive). This includes the
 points where the soliton term would push the phase-matching density past the
 zero-dispersion point: there the term has grown too strong for any anomalous-dispersion
 density to phase-match, which is a property of the term, not of the linear design. So
@@ -80,11 +80,6 @@ from solprop.tools.rdw_space.soliton_term import (
 )
 
 __all__ = ["Solved", "solve_rho"]
-
-# Largest phase-matching density searched, as a multiple of the linear one (the
-# bracket of the design). Points whose root lies beyond it are masked as having none,
-# so this cap, not only the physics, can set the edge of the no-root region.
-_RHO_SPAN = 3.0
 
 
 @dataclass(frozen=True)
@@ -113,8 +108,8 @@ class Solved:
     normal_dispersion : numpy.ndarray
         True where ``beta2 >= 0`` at the linear density: no soliton at all.
     no_root : numpy.ndarray
-        True where no anomalous-dispersion density up to ``3 rho_lin`` phase-matches
-        (or, never seen in practice, the iteration did not converge).
+        True where no density below the zero-dispersion density ``w2 / (g2 a^2)``
+        phase-matches (or, never seen in practice, the iteration did not converge).
     no_soliton : numpy.ndarray
         True where ``N <= 1/2`` at `rho`. The shipped terms vanish there, so `rho`
         is the linear density. Such points are never designs, but are not masked.
@@ -260,7 +255,8 @@ def _check_inputs(
         raise ValueError(f"fwhm must be finite and positive, got {fwhm!r}")
 
 
-# Smallest 1/N searched: the zero-dispersion density itself has N infinite.
+# Smallest 1/N searched, so the search stops just short of the zero-dispersion density,
+# where N is infinite (rho_z is excluded: there is no soliton there).
 _U_FLOOR = 1e-8
 
 
@@ -439,7 +435,9 @@ def solve_rho(
     ------
     ValueError
         If a grid is not a non-empty 1-D array of finite positive numbers, `fwhm` is
-        not finite and positive, or the term is negative at the linear density.
+        not finite and positive, the gas dispersion ``g2`` at the pump is not
+        positive (there would be no zero-dispersion density to bound the search), or
+        the term is negative at the linear density.
 
     Examples
     --------
@@ -455,6 +453,10 @@ def solve_rho(
     a = np.asarray(a, dtype=float)
     energy = np.asarray(energy, dtype=float)
     _check_inputs(a, energy, fwhm)
+    if not c.g2 > 0.0:
+        raise ValueError(
+            f"the gas must have normal dispersion at the pump (g2 > 0), got {c.g2!r}"
+        )
     shape = (energy.size, a.size)
     t0 = pulse_width(fwhm, "sech")
     radius_sq = np.broadcast_to(a**2, shape).ravel()
@@ -483,9 +485,8 @@ def solve_rho(
     moving = term_lin > 0.0
     index = anomalous[moving]
     part = problem.subset(index)
-    rho_zero = part.disp_wg / c.g2 if c.g2 > 0.0 else np.full(index.size, np.inf)
-    rho_cap = np.minimum(_RHO_SPAN * rho_lin[index], rho_zero)
-    u_cap = np.maximum(part.u_of_rho(rho_cap), _U_FLOOR)
+    # The only upper bound is physical: the zero-dispersion density, u = 1/N = 0.
+    u_cap = np.full(index.size, _U_FLOOR)
     state = _first_step(
         part,
         1.0 / order_lin[moving],
