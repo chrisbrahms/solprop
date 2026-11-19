@@ -24,9 +24,11 @@ depend on tier-3 inputs, a change of those can move the axes and so rerun tier 2
 :meth:`RdwSpace.compute` takes pinned axes to avoid that.
 """
 
+import functools
 import math
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields, replace
+from types import MappingProxyType
 from typing import Literal
 
 import numpy as np
@@ -67,6 +69,7 @@ _CRITICAL_POWER_FACTOR = 1.86225
 # Longest wavelength searched for the ZDW of a point, m (solprop's zdw default).
 _ZDW_LONGEST = 3e-6
 _MASK_NAMES = ("normal_dispersion", "no_root", "no_soliton")
+_BEYOND_EOS = "beyond_eos"
 # Auto axes: an edge the allowed region touches moves out by this factor, so often.
 _WIDEN = 1.5
 _WIDEN_PASSES = 3
@@ -148,12 +151,17 @@ class SpaceResult:
     solved : Solved
         The phase-matching density and soliton quantities.
     pressure : numpy.ndarray
-        Gas pressure in bar at the solved density (pressure table), NaN where masked.
+        Gas pressure in bar at the solved density (pressure table), NaN where masked
+        or `beyond_eos`.
     flength : numpy.ndarray
         Available fibre length ``max(max_length - d_in - d_out, 0)`` in m (HiSol
         ``Focusing.max_flength``).
-    masks : dict of str to numpy.ndarray
-        ``normal_dispersion``, ``no_root`` and ``no_soliton`` from `solved`.
+    masks : Mapping of str to numpy.ndarray
+        ``normal_dispersion``, ``no_root`` and ``no_soliton`` from `solved`, and
+        ``beyond_eos``: a phase-matching density above the top of solprop's equation
+        of state, where no pressure exists. Such points have NaN pressure (so a window
+        there does not fit, as in :mod:`._axes`) and are never allowed (`ratios`'
+        ``allowed`` is false there). HiSol would evaluate Luna's equation of state.
     region_empty : bool
         True when no grid point is allowed, or the linear length-limited corner does
         not exist and the automatic axes fell back.
@@ -168,6 +176,11 @@ class SpaceResult:
         axes.
     computed_tiers : tuple of int
         The tiers this call ran, ``()`` for a repeated call.
+
+    Notes
+    -----
+    Every array is read-only: the arrays are shared with the cache of
+    :class:`RdwSpace`, so writing to one raises instead of corrupting later results.
     """
 
     a: Float[np.ndarray, " na"]
@@ -176,7 +189,7 @@ class SpaceResult:
     solved: Solved
     pressure: Float[np.ndarray, "ne na"]
     flength: Float[np.ndarray, "ne na"]
-    masks: dict[str, Bool[np.ndarray, "ne na"]]
+    masks: Mapping[str, Bool[np.ndarray, "ne na"]]
     region_empty: bool
     eos_limited: bool
     computed_tiers: tuple[int, ...]
@@ -186,6 +199,46 @@ def _finite_or_none(value: float | np.ndarray) -> float | None:
     """Return a scalar as a float, None if it is NaN (infinity is kept: no window)."""
     number = float(value)
     return None if math.isnan(number) else number
+
+
+def _read_only[T](value: T) -> T:
+    """Make `value`'s arrays read-only in place (an array, or a dataclass of them)."""
+    arrays = (
+        [getattr(value, f.name) for f in fields(value)]  # pyright: ignore[reportArgumentType]
+        if not isinstance(value, np.ndarray)
+        else [value]
+    )
+    for array in arrays:
+        if isinstance(array, np.ndarray):
+            array.setflags(write=False)
+    return value
+
+
+@functools.cache
+def _eos_top(gas: str) -> float:
+    """Return the largest density in m^-3 at which solprop's EOS gives a pressure.
+
+    Found to a relative 1e-10 by bisection in ``log10 rho`` above 1e18 m^-3, with
+    decades tried up to 1e35 m^-3 (infinity if all succeed).
+    """
+
+    def _works(log_rho: float) -> bool:
+        try:
+            physdata.pressure(gas, 10.0**log_rho)
+        except MaterialError:
+            return False
+        return True
+
+    low = 18.0
+    while _works(low + 1.0):
+        low += 1.0
+        if low >= 35.0:
+            return math.inf
+    high = low + 1.0
+    while high - low > 4e-11:
+        middle = 0.5 * (low + high)
+        low, high = (middle, high) if _works(middle) else (low, middle)
+    return 10.0**low
 
 
 class RdwSpace:
@@ -215,10 +268,12 @@ class RdwSpace:
         self._term = term
         self._tier1: tuple[tuple[object, ...], GasConstants] | None = None
         self._table: tuple[str, float, Callable[..., np.ndarray]] | None = None
-        self._tier2: tuple[tuple[object, ...], Solved, np.ndarray] | None = None
+        self._tier2: (
+            tuple[tuple[object, ...], Solved, np.ndarray, np.ndarray] | None
+        ) = None
         self._last: tuple[tuple[object, ...], SpaceResult] | None = None
         self._widened: (
-            tuple[tuple[bytes, bytes], tuple[np.ndarray, np.ndarray]] | None
+            tuple[tuple[object, ...], tuple[np.ndarray, np.ndarray]] | None
         ) = None
 
     def _constants(self, inputs: SpaceInputs) -> tuple[GasConstants, bool]:
@@ -238,26 +293,27 @@ class RdwSpace:
         self._tier1 = (key, c)
         return c, True
 
-    def _pressure(self, gas: str, rho: Float[np.ndarray, "ne na"]) -> np.ndarray:
-        """Return the pressure in bar from a table covering `rho`, NaN where masked.
+    def _pressure(
+        self, gas: str, rho: Float[np.ndarray, "ne na"]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the pressure in bar from a table, and where `rho` is past the EOS.
 
-        The table is rebuilt when the gas changes or a density exceeds its top, which is
-        then set to the next power of ten above twice the largest density (or just
-        above it, if that lies past the equation of state).
+        The pressure is NaN where `rho` is NaN or past the equation of state. The
+        table is rebuilt when the gas changes or a density exceeds its top, which is
+        then the next power of ten above twice the largest density, capped at the top
+        of the equation of state.
         """
-        finite = rho[np.isfinite(rho)]
+        top = _eos_top(gas)
+        beyond = np.isfinite(rho) & (rho > top)
+        inside = np.where(beyond, np.nan, rho)
+        finite = inside[np.isfinite(inside)]
         if finite.size == 0:
-            return np.full(rho.shape, np.nan)
+            return np.full(rho.shape, np.nan), beyond
         needed = float(finite.max())
         if self._table is None or self._table[0] != gas or self._table[1] < needed:
-            rho_max = 10.0 ** math.ceil(math.log10(2.0 * needed))
-            try:
-                table = pressure_table(gas, rho_max)
-            except MaterialError:
-                rho_max = needed * (1.0 + 1e-6)
-                table = pressure_table(gas, rho_max)
-            self._table = (gas, rho_max, table)
-        return self._table[2](rho)
+            rho_max = min(10.0 ** math.ceil(math.log10(2.0 * needed)), top)
+            self._table = (gas, rho_max, pressure_table(gas, rho_max))
+        return self._table[2](inside), beyond
 
     def compute(
         self,
@@ -300,15 +356,18 @@ class RdwSpace:
         c, ran_1 = self._constants(inputs)
         tiers = [1] if ran_1 else []
         if axes is not None:
+            # Copied: the caller may change its arrays after the call.
             pinned = (
-                np.asarray(axes[0], dtype=float),
-                np.asarray(axes[1], dtype=float),
+                _read_only(np.array(axes[0], dtype=float)),
+                _read_only(np.array(axes[1], dtype=float)),
             )
             return self._run(c, inputs, pinned, flags=(False, False), tiers=tiers)
         auto = auto_axes(c, inputs, points)
-        a, energy = auto.a, auto.energy
+        a, energy = _read_only(auto.a), _read_only(auto.energy)
         flags = (auto.fallback, auto.eos_limited)
-        start = (a.tobytes(), energy.tobytes())
+        # The widening depends on the whole result, so on every input, not only on
+        # the starting axes (which stop depending on some inputs when they fall back).
+        start = (a.tobytes(), energy.tobytes(), inputs)
         if self._widened is not None and self._widened[0] == start:
             return self._run(c, inputs, self._widened[1], flags=flags, tiers=tiers)
         result = self._run(c, inputs, (a, energy), flags=flags, tiers=tiers)
@@ -321,9 +380,11 @@ class RdwSpace:
             if not (right or top):
                 break
             if right:
-                a = span(a[0], _WIDEN * a[-1], points, log=inputs.log_a)
+                a = _read_only(span(a[0], _WIDEN * a[-1], points, log=inputs.log_a))
             if top:
-                energy = span(energy[0], _WIDEN * energy[-1], points, log=inputs.log_e)
+                energy = _read_only(
+                    span(energy[0], _WIDEN * energy[-1], points, log=inputs.log_e)
+                )
             result = self._run(c, inputs, (a, energy), flags=flags, tiers=tiers)
         self._widened = (start, (a, energy))
         return result
@@ -346,11 +407,13 @@ class RdwSpace:
         assert self._tier1 is not None
         key2 = (self._tier1[0], inputs.fwhm, a.tobytes(), energy.tobytes(), self._term)
         if self._tier2 is None or self._tier2[0] != key2:
-            solved = solve_rho(c, a, energy, inputs.fwhm, term=self._term)
-            self._tier2 = (key2, solved, self._pressure(inputs.gas, solved.rho))
+            solved = _read_only(solve_rho(c, a, energy, inputs.fwhm, term=self._term))
+            pressure, beyond = self._pressure(inputs.gas, solved.rho)
+            self._tier2 = (key2, solved, _read_only(pressure), _read_only(beyond))
             tiers.append(2)
-        _, solved, pressure = self._tier2
-        key3 = (key2, inputs)
+        _, solved, pressure, beyond = self._tier2
+        # The axis flags feed region_empty and eos_limited, so they are in the key.
+        key3 = (key2, inputs, flags)
         if self._last is not None and self._last[0] == key3 and not tiers:
             return replace(self._last[1], computed_tiers=())
         d_in = distance(
@@ -373,14 +436,19 @@ class RdwSpace:
                 s_loss=inputs.s_loss,
                 s_fiss=inputs.s_fiss,
             )
+        # No pressure past the equation of state: never a design there.
+        allowed = result_ratios.allowed & ~beyond
+        result_ratios = _read_only(replace(result_ratios, allowed=allowed))
+        masks = {name: getattr(solved, name) for name in _MASK_NAMES}
+        masks[_BEYOND_EOS] = beyond
         result = SpaceResult(
             a=a,
             energy=energy,
             ratios=result_ratios,
             solved=solved,
             pressure=pressure,
-            flength=flength,
-            masks={name: getattr(solved, name) for name in _MASK_NAMES},
+            flength=_read_only(flength),
+            masks=MappingProxyType(masks),
             region_empty=fallback or not bool(result_ratios.allowed.any()),
             eos_limited=eos_limited,
             computed_tiers=(*sorted(set(tiers)), 3),
@@ -410,7 +478,9 @@ class RdwSpace:
         -------
         dict
             SI units, pressure in bar; ``None`` where a number does not exist at the
-            point (masked: no phase-matching density), never a number that looks valid.
+            point (masked: no phase-matching density; or ``beyond_eos``: no pressure,
+            so no pressure, constraint distance, window or mirror size, total length or
+            ZDW), never a number that looks valid.
             ``radius``, ``energy``; ``pressure``, ``density`` (m^-3), ``rho_a2``
             (m^-1); ``dbeta_nl`` the soliton term (1/m); ``n`` the soliton order,
             ``n_min``, ``n_max`` its limits (HiSol ``Limits.Nmin``, ``Limits.Nmax``);
@@ -428,7 +498,7 @@ class RdwSpace:
             constraint ``window_thickness_in`` or ``_out`` (m), for a damage constraint
             ``mirror_beam_radius_in`` or ``_out`` (1/e^2, m); ``flags`` the names of
             the masks set at the point (``normal_dispersion``, ``no_root``,
-            ``no_soliton``).
+            ``no_soliton``, ``beyond_eos``).
         """
         c, _ = self._constants(inputs)
         radii = np.array([float(a)])
@@ -437,7 +507,13 @@ class RdwSpace:
         )
         ok = bool(solved.ok[0, 0])
         rho = float(solved.rho[0, 0])
-        pressure = physdata.pressure(c.gas, rho) if ok else math.nan
+        pressure = math.nan
+        beyond = False
+        if ok:
+            try:
+                pressure = physdata.pressure(c.gas, rho)
+            except MaterialError:
+                beyond = True
         out: dict[str, float | str | list[str] | None] = {
             "radius": float(a),
             "energy": float(energy),
@@ -461,6 +537,9 @@ class RdwSpace:
             ("out", inputs.output_constraint),
         ):
             got = details(constraint, a, energy, inputs.fwhm, pressure)
+            if beyond:
+                # A damage or fixed distance exists, but the design does not.
+                got = {key: np.asarray(math.nan) for key in got}
             out[f"d_{end}"] = _finite_or_none(got["distance"])
             lengths += float(got["distance"])
             if isinstance(constraint, WindowConstraint):
@@ -477,11 +556,11 @@ class RdwSpace:
         )
         out["i_crit"] = _finite_or_none(p_crit / area)
         out["i_supp"] = c.isupp
-        out["zdw"] = _point_zdw(c, inputs, a, pressure) if ok else None
+        out["zdw"] = _point_zdw(c, inputs, a, pressure) if ok and not beyond else None
         out["beta2"] = _finite_or_none(solved.beta2[0, 0])
         out["flags"] = [
             name for name in _MASK_NAMES if bool(getattr(solved, name)[0, 0])
-        ]
+        ] + ([_BEYOND_EOS] if beyond else [])
         return out
 
 

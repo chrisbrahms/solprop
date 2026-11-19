@@ -20,7 +20,7 @@ HiSol's ``aplot_energy_maxlength`` radius defaults, 10 to 350 um, and 1 uJ to 1 
 
 A window constraint needs the pressure at ``rho a^2 / a^2`` for each scanned radius.
 solprop's equation of state has no solution past the top of its domain (for He near
-1e29 m^-3, 10 kbar, reached below about 1.6 um); such a radius is treated as not
+5.4e28 m^-3, 10 kbar, reached below about 2.2 um); such a radius is treated as not
 fitting, where HiSol would evaluate Luna's equation of state there. When that could
 have changed the outcome (no radius fits, or the radius just past the last fitting one
 is such a radius), :attr:`Axes.eos_limited` says so.

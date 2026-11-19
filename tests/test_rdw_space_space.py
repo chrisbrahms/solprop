@@ -14,6 +14,7 @@ from solprop import physdata
 from solprop.tools.rdw_space import (
     DamageConstraint,
     FixedConstraint,
+    NoConstraint,
     RdwSpace,
     SpaceInputs,
     WindowConstraint,
@@ -376,3 +377,101 @@ def test_eos_limited_flags_a_corner_scan_cut_by_the_equation_of_state():
     # Pinned axes never run the scan.
     pinned = space.compute(crowded, 16, axes=(fitting.a, fitting.energy))
     assert not pinned.eos_limited
+
+
+# ------------------------------------------------------------- cache safety
+
+
+def test_returned_arrays_are_read_only_and_pinned_axes_are_copied():
+    space = RdwSpace()
+    a = np.linspace(40e-6, 200e-6, 12)
+    energy = np.linspace(20e-6, 800e-6, 10)
+    first = space.compute(_inputs(), 0, axes=(a, energy))
+    arrays = [first.a, first.energy, first.pressure, first.flength]
+    arrays += [first.solved.rho, first.solved.order, first.ratios.allowed]
+    arrays += list(first.masks.values())
+    for array in arrays:
+        with pytest.raises(ValueError, match="read-only"):
+            array[...] = 0
+    with pytest.raises(TypeError):
+        first.masks["no_root"] = np.zeros_like(first.masks["no_root"])  # pyright: ignore[reportIndexIssue]
+    rho = first.solved.rho.copy()
+    pinned = (a.copy(), energy.copy())
+    a[:] = 1e-3  # the caller reuses its array
+    np.testing.assert_array_equal(first.a, pinned[0])
+    again = space.compute(_inputs(max_length=4.0), 0, axes=pinned)
+    assert again.computed_tiers == (3,)
+    np.testing.assert_array_equal(again.solved.rho, rho)
+
+
+def test_auto_axes_cannot_be_corrupted_through_a_result():
+    space = RdwSpace()
+    first = space.compute(_inputs(), 16)
+    with pytest.raises(ValueError, match="read-only"):
+        first.a[:] = 1e-3
+    assert space.compute(_inputs(), 16).computed_tiers == ()
+
+
+def _window() -> WindowConstraint:
+    silica = window_presets()["SiO2"]
+    return WindowConstraint(800e-9, silica.n2, elastic_limit=silica.elastic_limit)
+
+
+def test_axis_flags_are_part_of_the_tier_three_key():
+    crowded = _inputs(
+        input_constraint=_window(), output_constraint=FixedConstraint(5.5)
+    )
+    auto_first = RdwSpace()
+    auto = auto_first.compute(crowded, 16)
+    assert auto.eos_limited and auto.region_empty
+    axes = (auto.a, auto.energy)
+    pinned = auto_first.compute(crowded, 16, axes=axes)
+    assert pinned.computed_tiers == (3,) and not pinned.eos_limited
+    pinned_first = RdwSpace()
+    assert not pinned_first.compute(crowded, 16, axes=axes).eos_limited
+    again = pinned_first.compute(crowded, 16)
+    assert again.computed_tiers == (3,) and again.eos_limited
+
+
+def test_widening_is_cached_per_input_not_per_starting_axes():
+    # At 60 km and 100 km the length-limited corner lies past the scan's 20 mm top,
+    # so both start from the same axes, but the default term's region widens them
+    # differently (absurd lengths, chosen only to share the starting axes).
+    short, long = _inputs(max_length=6e4), _inputs(max_length=1e5)
+    space = RdwSpace()
+    space.compute(short, 24)
+    shared = space.compute(long, 24)
+    fresh = RdwSpace().compute(long, 24)
+    np.testing.assert_array_equal(shared.a, fresh.a)
+    np.testing.assert_array_equal(shared.energy, fresh.energy)
+    assert shared.a[-1] != space.compute(short, 24).a[-1]
+
+
+# ------------------------------------------------- beyond the equation of state
+
+SMALL_CORES = np.linspace(3e-6, 40e-6, 12)
+SMALL_CORE_ENERGIES = np.linspace(1e-7, 2e-5, 12)
+
+
+@pytest.mark.parametrize("constraint", [NoConstraint(), _window()])
+def test_densities_past_the_equation_of_state_are_masked_not_raised(constraint):
+    inputs = _inputs(input_constraint=constraint, output_constraint=NoConstraint())
+    axes = (SMALL_CORES, SMALL_CORE_ENERGIES)
+    result = RdwSpace().compute(inputs, 0, axes=axes)
+    beyond = result.masks["beyond_eos"]
+    assert beyond[:, 0].any()
+    assert not beyond[:, -1].any()
+    assert np.all(np.isnan(result.pressure[beyond]))
+    assert not result.ratios.allowed[beyond].any()
+    assert np.all(np.isfinite(result.pressure[result.solved.ok & ~beyond]))
+
+
+def test_point_past_the_equation_of_state_reports_the_flag_and_no_pressure():
+    inputs = _inputs()
+    result = RdwSpace().compute(inputs, 0, axes=(SMALL_CORES, SMALL_CORE_ENERGIES))
+    row = int(np.flatnonzero(result.masks["beyond_eos"][:, 0])[0])
+    point = RdwSpace().point(inputs, 3e-6, float(SMALL_CORE_ENERGIES[row]))
+    assert point["flags"] == ["beyond_eos"]
+    for key in ("pressure", "d_in", "d_out", "total_length", "zdw"):
+        assert point[key] is None, key
+    assert point["density"] is not None
