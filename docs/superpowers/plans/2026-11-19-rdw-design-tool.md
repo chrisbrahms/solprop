@@ -26,7 +26,7 @@
 
 1. A point where `β₂ ≥ 0` (normal dispersion, e.g. high pressure or small `a`): masked, flagged `normal_dispersion`, never `NaN` in a colour panel without a mask.
 2. No root of the ρ equation (soliton term cancels the linear mismatch): masked, flagged `no_root`, and the picker says so instead of reporting numbers.
-3. `N ≤ ½` (no soliton exists): the soliton term is zero, the point is flagged `no_soliton`, and it never enters the allowed region.
+3. `N ≤ ½` (no soliton, so no self-compression): maintainer-confirmed that such points are never solutions. The soliton term is zero there, the point is flagged `no_soliton`, and it never enters the allowed region. (HiSol's `N_min = 1.15 + (0.04 + 0.3·log10(λ0/λt))·c·τ/λ0` is above 1.15 whenever λt < λ0, so the N_min ratio excludes these points anyway; the flag makes it explicit.)
 4. Grid axes when the region is empty or tiny (λ_target close to λ0, `maxlength` below the constraint distances): the page shows "no allowed region" and does not raise.
 5. A fast burst of edits: only the newest request's reply is drawn (kernel supersedes by kind and key; the stage also ignores a reply whose request id is not current).
 
@@ -147,7 +147,7 @@ Tests: `tests/tools/test_rdw_space_*.py`, `tests/service/test_rdw_space.py`, `gu
 
 **Interfaces:** the Julia script writes JSON with HiSol's own gas-dependent numbers (`dbeta_wg`, `dbeta_rho`, `g2`, `w2`, `n2_0`, `gamma3`, `isupp`, `alpha_bar`, `aeff0`) and, for the canonical case (He, 160 nm from 800 nm/10 fs, 5 m, `WindowConstraint` fixed-thickness SiO₂ at the pump, `FixedConstraint` input as in `examples/design_space_160nm_He.jl`), HiSol's outputs `RadiusParams`-style at `(a, E) = (125e-6, 200e-6)` including `flength = 2.8737700334469096` (HiSol `performance_plan.md`), `Lfiss`, `N`, `Nmin`, `Nmax`, `ρasq`. The JSON records the HiSol commit, branch, and the exact command.
 
-- [ ] **Step 1: Write the Julia script** (read-only on HiSol; run with `julia --project=~/.julia/dev/HiSol tools/dump_hisol_reference.jl`; if `julia` is missing say so and stop).
+- [ ] **Step 1: Write the Julia script.** Julia 1.13.3 is installed and HiSol (branch `new-constraints`, checked out in `~/.julia/dev/HiSol`) loads in the default environment, so run it as `julia tools/dump_hisol_reference.jl`. Leave HiSol's working tree as it is (it has an unrelated local `.gitignore` change).
 - [ ] **Step 2: Run it and inspect the JSON.** Expected: the `flength` above.
 - [ ] **Step 3: Failing test:** build `GasConstants` from the JSON (a `GasConstants(...)` constructed directly), run `RdwSpace` with a zero soliton term, and assert `point(...)` values equal HiSol's to rtol 1e-6 for `n`, `n_min`, `n_max`, `l_fiss`, `hcf_length` (the formulas must match exactly when the gas numbers match).
 - [ ] **Step 4: Fix any formula difference found in Tasks 3 to 6** (the test is the oracle), run to pass.
