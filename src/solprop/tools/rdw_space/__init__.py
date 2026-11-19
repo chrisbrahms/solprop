@@ -3,3 +3,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """Design space of resonant dispersive wave emission in a gas-filled capillary."""
+
+from solprop.tools.rdw_space.soliton_term import (
+    DEFAULT_SOLITON_TERM,
+    SolitonTerm,
+    largest_constituent_power,
+    novoa_pr425,
+    solprop_half,
+)
+
+__all__ = [
+    "DEFAULT_SOLITON_TERM",
+    "SolitonTerm",
+    "largest_constituent_power",
+    "novoa_pr425",
+    "solprop_half",
+]
