@@ -1,7 +1,7 @@
 # RDW design-space tool: design (prototype)
 
 *Written by Claude (AI-drafted), 2026-11-19, from a conversation with the maintainer.
-Status: draft awaiting approval. The physics in "Model" must be checked by the
+Status: approved by the maintainer 2026-11-19 (soliton-term convention decided, see Decisions). The physics in "Model" must be checked by the
 maintainer before it is relied on.*
 
 ## Intent
@@ -156,11 +156,14 @@ linear limit as a starting range and widened if the soliton term moves the allow
 - Timing target: tier 3 under 20 ms; coarse tier 2 under about 100 ms; full grid under about
   1 s. Measured and reported, not asserted.
 
-## Open items
+## Decisions
 
-1. **Convention for the soliton term**: solprop's existing `γ·P_largest/2`, or PR #425's
-   Novoa-style `γ·P_sc·ω/ω_p`. Both use the same `P_largest`. The maintainer decides; the code
-   keeps the choice as one clearly marked parameter, so the other can be compared.
+1. **Soliton-term convention (maintainer, 2026-11-19): use solprop's existing one**,
+   `γ·P_largest/2` (`nonlinear_phase="largest"`). The maintainer does not assume this equation
+   is final: the term lives in one small, clearly named, replaceable function (the mismatch
+   contribution as a function of `ρ`, `a`, `E`, `τ`, `ω`), with the PR #425 form
+   (`γ·P_largest·ω/ω_p`) kept as a documented alternative that tests can switch to. Nothing else
+   in the solver may depend on the form of the term.
 
 ## Calls made by Claude (builder-check answers, to be checked)
 
