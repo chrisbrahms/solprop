@@ -140,6 +140,26 @@ def test_a_preset_sends_its_name_and_leaves_the_numbers_to_the_kernel(
     assert message.startswith("input_constraint.preset: must be one of ['CaF2'")
 
 
+def test_a_preset_chosen_after_explicit_numbers_leaves_them_out(
+    model: RdwInputs,
+) -> None:
+    model.set_constraint_value("in", "preset", "")
+    model.set_constraint_value("in", "material", "2.6e-20 m^2/W")
+    model.set_constraint_value("in", "elastic_limit", "55 MPa")
+    assert "preset" not in constraint(model)
+    model.set_constraint_value("in", "preset", "MgF2")
+    got = constraint(model)
+    assert got["preset"] == "MgF2"
+    assert "material" not in got
+    assert "elastic_limit" not in got
+    assert model.constraint_value("in", "material") == "2.6e-20 m^2/W"  # kept
+    model.set_constraint_value("in", "preset", "")
+    got = constraint(model)
+    assert "preset" not in got
+    assert got["material"] == pytest.approx(2.6e-20)
+    assert got["elastic_limit"] == pytest.approx(55e6)
+
+
 def test_an_empty_optional_field_is_none(model: RdwInputs) -> None:
     model.set_constraint_value("in", "thickness", "")
     model.set_constraint_value("in", "lidt", "")

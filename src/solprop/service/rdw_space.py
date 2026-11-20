@@ -682,7 +682,8 @@ def _constraint_type(name: str) -> dict[str, object]:
                 "optional_none": False,
                 "alternative": None,
                 "help": "A key of window_presets: supplies the material n2 and the "
-                "elastic limit unless the constraint gives them.",
+                "elastic limit unless the constraint gives them (an explicit "
+                "value always wins over the preset, so send only one of them).",
             }
         )
     return {"name": name, "label": _CONSTRAINT_LABELS[name], "fields": out}

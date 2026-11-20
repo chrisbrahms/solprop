@@ -470,12 +470,46 @@ def test_listed_names_are_exactly_the_accepted_keys(name: str) -> None:
         _inputs(
             {**INPUTS, "input_constraint": {"type": name, "not_a_field": 1.0}},
         )
-    # And accepts each listed key (given a valid value for its kind).
+
+
+def sample(field: dict[str, Any]) -> Any:
+    """Return a valid payload value for a field, from its own kind and unit."""
+    kind = field["kind"]
+    if kind == "choice":
+        return options()["window_presets"][0]["name"]
+    if kind == "rounding":
+        return True
+    assert field["unit"] != "mm"
+    return {
+        "length": 0.05,
+        "wavelength": 800e-9,
+        "time": 10e-15,
+        "energy_density": 2000.0,
+        "pressure": 55e6,
+        "index": 2.6e-20,
+        "number": 2.0,
+    }[kind]
+
+
+@pytest.mark.medium
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_each_listed_key_alone_is_accepted_and_others_refused(name: str) -> None:
+    entry = next(e for e in options()["constraint_types"] if e["name"] == name)
     base = constraint_from(entry)
-    for key in listed:
-        if key == "preset":
-            continue
-        _inputs({**INPUTS, "input_constraint": base})
+    for field in entry["fields"]:
+        key = field["name"]
+        out = space(
+            {**INPUTS, "input_constraint": {**base, key: sample(field)}}, points=2
+        )
+        assert out["shape"] == [2, 2], key
+        # A misspelled listed name is refused, naming it.
+        with pytest.raises(SolpropError, match=rf"input_constraint\.{key}x"):
+            space(
+                {**INPUTS, "input_constraint": {**base, f"{key}x": sample(field)}},
+                points=2,
+            )
+    with pytest.raises(SolpropError, match=r"input_constraint\.not_a_field"):
+        space({**INPUTS, "input_constraint": {**base, "not_a_field": 1.0}}, points=2)
 
 
 @pytest.mark.parametrize("name", list(CLASSES))

@@ -335,9 +335,11 @@ class RdwInputs:
             text = texts[name]
             where = f"{path}.{name}"
             alternative = field["alternative"]
+            if alternative is not None and texts.get(str(alternative)):
+                # The preset supplies it. The kernel lets an explicit value win over
+                # a preset, so a stale typed value is left out (and kept as text).
+                continue
             if not text:
-                if alternative is not None and texts.get(str(alternative)):
-                    continue  # the preset supplies it
                 if field["required"]:
                     raise InputError(f"{where}: is required")
                 if field["optional_none"]:
