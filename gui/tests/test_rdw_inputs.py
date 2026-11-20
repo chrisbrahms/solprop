@@ -341,6 +341,7 @@ def test_a_reply_with_a_wrong_grid_is_refused(model: RdwInputs) -> None:
 
 
 ORDER = [
+    "allowed",
     "radius",
     "energy",
     "pressure",
@@ -350,14 +351,21 @@ ORDER = [
     "n",
     "n_min",
     "n_max",
+    "ratio_loss",
+    "ratio_fiss",
+    "ratio_nmin",
+    "ratio_nmax",
     "l_fiss",
     "l_loss",
     "hcf_length",
+    "available_length",
     "d_in",
     "d_out",
     "window_thickness_in",
     "window_thickness_out",
     "total_length",
+    "p0",
+    "gamma",
     "intensity",
     "i_crit",
     "i_supp",
@@ -383,6 +391,12 @@ def test_a_real_point_reply_is_ordered_and_scaled(model: RdwInputs) -> None:
     assert rows["zdw"]["unit"] == "nm"
     assert rows["d_in"]["unit"] == "m"
     assert rows["flags"]["text"] == "none"
+    assert rows["allowed"]["text"] == ("yes" if reply["allowed"] else "no")
+    assert rows["p0"]["value"] == pytest.approx(reply["p0"] * 1e-9)  # pyright: ignore[reportOperatorIssue]
+    assert rows["p0"]["unit"] == "GW"
+    assert rows["hcf_length"]["label"] == "HCF length needed (S_fiss x L_fiss)"
+    assert shown["notes"] == []
+    assert shown["recipe_note"] is None
     assert shown["recipe_text"] == reply["recipe_text"]
     assert isinstance(shown["recipe_text"], str)
 
@@ -414,3 +428,28 @@ def test_the_check_note_and_an_infinite_distance_show() -> None:
     assert rows["d_in"]["text"] == "∞"
     assert rows["rdw_check"]["text"] == "—"
     assert rows["rdw_check_note"]["text"] == "no equivalent for the novoa term"
+
+
+def test_a_point_not_allowed_names_the_ratios_at_one_or_more() -> None:
+    reply = {
+        "allowed": False,
+        "ratio_loss": 0.5,
+        "ratio_fiss": float("inf"),
+        "ratio_nmin": 1.0,
+        "ratio_nmax": None,
+        "flags": [],
+        "notes": ["He: outside its range"],
+        "recipe_text": "[recipe]",
+        "recipe_note": "The recipe propagates the HE12 mode alone.",
+    }
+    shown = decode_point_reply(reply)
+    assert shown["allowed"] is False
+    assert shown["outside"] == ["length ratio ≥ 1", "N_min / N ratio ≥ 1"]
+    assert shown["notes"] == ["He: outside its range"]
+    assert shown["recipe_note"] == "The recipe propagates the HE12 mode alone."
+    rows = {str(r["key"]): r for r in shown["rows"]}  # pyright: ignore[reportGeneralTypeIssues]
+    assert rows["allowed"]["text"] == "no"
+    assert rows["ratio_fiss"]["text"] == "∞"
+    assert rows["ratio_nmax"]["text"] == "—"
+    allowed = decode_point_reply({**reply, "allowed": True})
+    assert allowed["outside"] == []

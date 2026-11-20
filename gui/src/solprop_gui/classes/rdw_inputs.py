@@ -490,6 +490,8 @@ class DecodedSpace:
         The tiers that ran.
     points : int
         The points asked for.
+    notes : tuple of str
+        The gas-data notes (data used outside its validity); empty if none.
     """
 
     a: np.ndarray
@@ -510,6 +512,7 @@ class DecodedSpace:
     eos_limited: bool
     tiers: tuple[int, ...]
     points: int
+    notes: tuple[str, ...] = ()
 
 
 def _copy(value: object, dtype: type) -> np.ndarray:
@@ -526,8 +529,8 @@ def decode_space_reply(reply: Mapping[str, object]) -> DecodedSpace:
         The kernel's reply: ``a`` and ``energy`` (float64), ``shape`` ``[ne, na]``,
         float32 grids ``loss``, ``fiss``, ``nmin``, ``nmax``, the ``uint8`` grid
         ``flags`` (bit 0 allowed, 1 normal dispersion, 2 no root, 3 no soliton, 4
-        beyond the equation of state), ``region_empty``, ``eos_limited``, ``tiers``
-        and ``points``.
+        beyond the equation of state), ``region_empty``, ``eos_limited``, ``tiers``,
+        ``points`` and ``notes``.
 
     Returns
     -------
@@ -560,6 +563,7 @@ def decode_space_reply(reply: Mapping[str, object]) -> DecodedSpace:
         eos_limited=bool(reply["eos_limited"]),
         tiers=tuple(int(t) for t in reply["tiers"]),  # pyright: ignore[reportGeneralTypeIssues]
         points=int(reply["points"]),  # pyright: ignore[reportArgumentType]
+        notes=tuple(str(n) for n in reply.get("notes") or ()),  # pyright: ignore[reportGeneralTypeIssues]
         **grids,
         **masks,
     )
@@ -577,9 +581,14 @@ _POINT_ROWS: Final[tuple[tuple[str, str, str, float], ...]] = (
     ("n", "Soliton order", "", 1.0),
     ("n_min", "Soliton order, lower limit", "", 1.0),
     ("n_max", "Soliton order, upper limit", "", 1.0),
+    ("ratio_loss", "Loss ratio", "", 1.0),
+    ("ratio_fiss", "Length ratio", "", 1.0),
+    ("ratio_nmin", "Order ratio N_min/N", "", 1.0),
+    ("ratio_nmax", "Order ratio N/N_max", "", 1.0),
     ("l_fiss", "Fission length", "m", 1.0),
     ("l_loss", "Loss length", "m", 1.0),
-    ("hcf_length", "Fibre length", "m", 1.0),
+    ("hcf_length", "HCF length needed (S_fiss x L_fiss)", "m", 1.0),
+    ("available_length", "Available length", "m", 1.0),
     ("d_in", "Input distance", "m", 1.0),
     ("d_out", "Output distance", "m", 1.0),
     ("window_thickness_in", "Input window thickness", "mm", 1e3),
@@ -587,6 +596,8 @@ _POINT_ROWS: Final[tuple[tuple[str, str, str, float], ...]] = (
     ("mirror_beam_radius_in", "Input mirror beam radius", "mm", 1e3),
     ("mirror_beam_radius_out", "Output mirror beam radius", "mm", 1e3),
     ("total_length", "Total length", "m", 1.0),
+    ("p0", "Peak power", "GW", 1e-9),
+    ("gamma", "Nonlinear coefficient", "1/(W m)", 1.0),
     ("intensity", "Peak intensity", "W/cm^2", 1e-4),
     ("i_crit", "Critical intensity", "W/cm^2", 1e-4),
     ("i_supp", "Barrier-suppression intensity", "W/cm^2", 1e-4),
@@ -603,12 +614,22 @@ def _row(
     return {"key": key, "label": label, "unit": unit, "value": value, "text": text}
 
 
+_RATIO_NAMES: Final = {
+    "ratio_loss": "loss",
+    "ratio_fiss": "length",
+    "ratio_nmin": "N_min / N",
+    "ratio_nmax": "N / N_max",
+}
+"""The four ratios, as a sentence names them."""
+
+
 def decode_point_reply(reply: Mapping[str, object]) -> dict[str, object]:
     """Read an ``rdw_space_point`` reply into labelled rows in a fixed display order.
 
     Nothing is computed: each number the reply has is scaled to its display unit (m to
-    um or nm, J to uJ, W/m^2 to W/cm^2) and formatted; ``None`` shows as an em dash.
-    Keys the reply does not have (a window's thickness without a window) give no row.
+    um or nm, J to uJ, W to GW, W/m^2 to W/cm^2) and formatted; ``None`` shows as an em
+    dash. Keys the reply does not have (a window's thickness without a window) give no
+    row.
 
     Parameters
     ----------
@@ -619,11 +640,22 @@ def decode_point_reply(reply: Mapping[str, object]) -> dict[str, object]:
     -------
     dict
         ``rows``: dicts ``key``, ``label``, ``unit``, ``value`` (scaled float, or
-        ``None``) and ``text`` (what to show); then the rows ``flags`` (the names of the
-        masks set at the point, or ``none``) and, if the reply has it,
-        ``rdw_check_note``. ``recipe_text``: the capillary recipe, or ``None``.
+        ``None``) and ``text`` (what to show), led by ``allowed`` (``Allowed``:
+        ``yes`` or ``no``) if the reply has it; then the rows ``flags`` (the names of
+        the masks set at the point, or ``none``) and, if the reply has it,
+        ``rdw_check_note``. ``allowed``: the reply's (``None`` without one).
+        ``outside``: the ratios at 1 or more at a point that is not allowed, as
+        words for a sentence (``"length ratio ≥ 1"``); empty otherwise.
+        ``recipe_text``: the capillary recipe, or ``None``. ``recipe_note``: what
+        the recipe adds (the mode it propagates), or ``None``. ``notes``: the
+        gas-data notes, a list.
     """
     rows: list[dict[str, object]] = []
+    allowed = reply.get("allowed")
+    if allowed is not None:
+        rows.append(
+            _row("allowed", "Allowed", "", bool(allowed), "yes" if allowed else "no")
+        )
     for key, label, unit, factor in _POINT_ROWS:
         if key not in reply:
             continue
@@ -639,5 +671,19 @@ def decode_point_reply(reply: Mapping[str, object]) -> dict[str, object]:
     note = reply.get("rdw_check_note")
     if note is not None:
         rows.append(_row("rdw_check_note", "Check", "", note, str(note)))
+    outside: list[str] = []
+    if allowed is False:
+        for key, name in _RATIO_NAMES.items():
+            ratio = reply.get(key)
+            if ratio is not None and float(ratio) >= 1.0:  # pyright: ignore[reportArgumentType]
+                outside.append(f"{name} ratio ≥ 1")
     recipe = reply.get("recipe_text")
-    return {"rows": rows, "recipe_text": None if recipe is None else str(recipe)}
+    recipe_note = reply.get("recipe_note")
+    return {
+        "rows": rows,
+        "allowed": None if allowed is None else bool(allowed),
+        "outside": outside,
+        "recipe_text": None if recipe is None else str(recipe),
+        "recipe_note": None if recipe_note is None else str(recipe_note),
+        "notes": [str(n) for n in reply.get("notes") or []],  # pyright: ignore[reportGeneralTypeIssues]
+    }

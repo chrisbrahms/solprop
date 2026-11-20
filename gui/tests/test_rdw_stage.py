@@ -297,6 +297,10 @@ def test_a_click_picks_the_cell_it_lands_in_on_a_non_square_grid(
     assert stage.readout_text("Phase-matched wavelength (check)") == "160 nm"
     assert stage.simulate_text() == reply["recipe_text"] is not None
     assert "Simulate this" in stage.recipe_note.text()
+    assert stage.readout_text("Allowed") == ("yes" if reply["allowed"] else "no")
+    hcf = stage.readout_text("HCF length needed (S_fiss x L_fiss)")
+    assert hcf == f"{reply['hcf_length']:.4g} m"
+    assert stage.readout_text("Available length") is not None
     for halo, cross in stage.plots.markers:
         assert np.size(cross.getData()[0]) == 1
         assert np.size(halo.getData()[0]) == 1
@@ -561,8 +565,11 @@ def test_home_leads_to_the_stage_and_simulate_this_opens_the_point(
 
 
 def test_a_real_kernel_draws_the_space_and_reads_a_point(
-    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, private_settings: None
 ) -> None:
+    # The bridge reads the machines from the settings: keep the user's out of it, as
+    # the window tests do.
+    del private_settings
     monkeypatch.setattr(rdw_stage, "COARSE", 8)
     monkeypatch.setattr(rdw_stage, "FULL", 12)
     bridge = ServiceBridge()
@@ -593,7 +600,63 @@ def test_a_real_kernel_draws_the_space_and_reads_a_point(
         qtbot.waitUntil(lambda: made.text is not None, timeout=WAIT_MS)
         assert made.readout_text("Total length") is not None
         assert made.readout_text("Phase-matched wavelength (check)") == "160 nm"
+        assert made.readout_text("Allowed") in ("yes", "no")
         assert "[recipe]" in (made.simulate_text() or "")
+        assert 'shape = "sech"' in (made.simulate_text() or "")
     finally:
         made.close()
         bridge.close()
+
+
+# ------------------------------------------------------------------ allowed, notes
+
+
+WINDOW = {"type": "window", "wavelength_ref": 800e-9, "preset": "SiO2"}
+
+
+def _point_reply(
+    options: Mapping[str, Any], radius: float, energy: float, **inputs: Any
+) -> dict[str, Any]:
+    payload = dict(RdwInputs(options).point_payload(radius, energy))
+    payload["inputs"] = {**dict(payload["inputs"]), **inputs}  # pyright: ignore[reportArgumentType, reportCallIssue]
+    return rdw_space_point(payload)  # pyright: ignore[reportReturnType]
+
+
+def test_a_point_outside_the_region_says_so_and_can_still_be_simulated(
+    stage: RdwStage, bridge: StubBridge, options: Mapping[str, Any]
+) -> None:
+    stage.pick(250e-6, 1e-3)
+    reply = _point_reply(
+        options, 250e-6, 1e-3, input_constraint=WINDOW, output_constraint=WINDOW
+    )
+    assert reply["allowed"] is False
+    bridge.answer(bridge.of("rdw_space_point")[-1][0], reply)
+    assert stage.readout_text("Allowed") == "no"
+    assert stage.readout_text("Available length") == "0 m"
+    assert stage.readout_text("Length ratio") == "∞"
+    note = stage.recipe_note.text()
+    assert "outside the allowed region: length ratio ≥ 1" in note
+    assert stage.simulate_text() == reply["recipe_text"] is not None
+
+
+def test_an_allowed_point_says_simulate_and_names_a_mode_it_propagates(
+    stage: RdwStage, bridge: StubBridge, options: Mapping[str, Any]
+) -> None:
+    stage.pick(125e-6, 250e-6)
+    reply = _point_reply(options, 125e-6, 250e-6, m=2)
+    bridge.answer(bridge.of("rdw_space_point")[-1][0], reply)
+    assert stage.readout_text("Allowed") == ("yes" if reply["allowed"] else "no")
+    assert "HE12 mode alone" in stage.recipe_note.text()
+    assert "outside" not in stage.recipe_note.text() or not reply["allowed"]
+
+
+def test_gas_data_notes_show_under_the_plots_and_go_away(
+    stage: RdwStage, bridge: StubBridge, coarse: dict[str, Any]
+) -> None:
+    assert stage.notes.isHidden()
+    drawn(stage, bridge, {**coarse, "notes": ["SF6: evaluated outside its range"]})
+    assert not stage.notes.isHidden()
+    assert stage.notes.text() == "Notes: SF6: evaluated outside its range"
+    assert stage.status.text() == ""  # a note is not an error
+    drawn(stage, bridge, coarse)
+    assert stage.notes.isHidden()

@@ -100,6 +100,10 @@ class RdwStage(QWidget):
         The picked point's numbers.
     status : PySide6.QtWidgets.QLabel
         Why the inputs or the kernel's answer failed; empty when nothing did.
+    notes : PySide6.QtWidgets.QLabel
+        Under the panels: the kernel's notes on the gas data (a gas law used outside
+        the range of its source) for the space and the picked point; hidden when
+        there are none. Not an error: the map is still drawn.
     busy : PySide6.QtWidgets.QLabel
         Shown while a request is unanswered.
     draw_ms : float
@@ -123,6 +127,8 @@ class RdwStage(QWidget):
         self._pick: tuple[float, float] | None = None
         self._full_axes: tuple[np.ndarray, np.ndarray] | None = None
         self._held: tuple[np.ndarray, np.ndarray] | None = None
+        self._space_notes: tuple[str, ...] = ()
+        self._point_notes: tuple[str, ...] = ()
         self._coarse = QTimer(self)
         self._coarse.setSingleShot(True)
         self._coarse.setInterval(_DEBOUNCE_MS)
@@ -170,6 +176,10 @@ class RdwStage(QWidget):
         self.plots = RdwPlots()
         self.plots.point_picked.connect(self.pick)
         column.addWidget(self.plots, 3)
+        self.notes = named_label("", "pageNote")
+        self.notes.setWordWrap(True)
+        self.notes.hide()
+        column.addWidget(self.notes)
         self.readout = QTableWidget(0, 2 * _READOUT_COLUMNS)
         self.readout.setObjectName("rdw-readout")
         self.readout.verticalHeader().hide()
@@ -391,6 +401,8 @@ class RdwStage(QWidget):
             if self.model is not None and self.hold.isChecked():
                 # Held before any full plot had come: hold this one's.
                 self._held = self._full_axes
+        self._space_notes = space.notes
+        self._show_notes()
         self.plots.set_space(space)
         self.plots.set_message(
             "No allowed region for these inputs." if space.region_empty else None
@@ -418,14 +430,26 @@ class RdwStage(QWidget):
             shown.setToolTip(text)
             self.readout.setItem(index % per_column, column, label)
             self.readout.setItem(index % per_column, column + 1, shown)
+        # Every row in view: the readout takes the height its rows need.
+        frame = 2 * self.readout.frameWidth()
+        self.readout.setMinimumHeight(
+            self.readout.horizontalHeader().height()
+            + per_column * self.readout.verticalHeader().defaultSectionSize()
+            + frame
+        )
         recipe = decoded["recipe_text"]
         self.text = None if recipe is None else str(recipe)
         self.recipe_changed.emit()
-        self.recipe_note.setText(
-            "Simulate this opens this capillary as a new setup."
-            if self.text is not None
-            else "No design at the picked point (a masked cell): nothing to simulate."
-        )
+        self._point_notes = tuple(decoded["notes"])  # pyright: ignore[reportArgumentType]
+        self._show_notes()
+        self.recipe_note.setText(_point_note(decoded, self.text is not None))
+
+    def _show_notes(self) -> None:
+        """Show the gas-data notes of the space and the point, each once."""
+        notes = list(dict.fromkeys((*self._space_notes, *self._point_notes)))
+        self.notes.setText("Notes: " + " ".join(notes) if notes else "")
+        self.notes.setToolTip("\n\n".join(notes))
+        self.notes.setVisible(bool(notes))
 
     def readout_text(self, key: str) -> str | None:
         """Return what the readout shows for a row of the point reply.
@@ -458,3 +482,26 @@ class RdwStage(QWidget):
             The recipe text, ``None`` with nothing to simulate.
         """
         return self.text
+
+
+def _point_note(decoded: Mapping[str, object], simulate: bool) -> str:
+    """Return the sentence under the readout: whether the point is a design.
+
+    - ``decoded``: :func:`~solprop_gui.classes.rdw_inputs.decode_point_reply`'s.
+    - ``simulate``: whether there is a recipe to simulate.
+    """
+    if not simulate:
+        return "No design at the picked point (a masked cell): nothing to simulate."
+    parts: list[str] = []
+    if decoded["allowed"] is False:
+        outside: Sequence[str] = decoded["outside"]  # pyright: ignore[reportAssignmentType]
+        why = ", ".join(outside) or "it is not a design (see the masks set)"
+        parts.append(
+            f"This point is outside the allowed region: {why}. Simulate this still "
+            "opens it as a new setup, but the design's limits are not met."
+        )
+    else:
+        parts.append("Simulate this opens this capillary as a new setup.")
+    if decoded["recipe_note"] is not None:
+        parts.append(str(decoded["recipe_note"]))
+    return " ".join(parts)
