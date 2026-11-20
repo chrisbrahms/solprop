@@ -19,6 +19,7 @@ class Stage(StrEnum):
 
     HOME = "home"
     DESIGN = "design"
+    RDW = "rdw"
     SETUP = "setup"
     RUN = "run"
     ANALYSE = "analyse"
@@ -93,10 +94,13 @@ def stage_open(stage: Stage, progress: Progress) -> bool:
     False
     >>> stage_open(Stage.RUN, Progress(has_run=True))
     True
+    >>> stage_open(Stage.RDW, Progress())
+    True
     """
     return {
         Stage.HOME: True,
         Stage.DESIGN: True,
+        Stage.RDW: True,
         Stage.SETUP: progress.has_setup,
         Stage.RUN: progress.running or progress.has_run,
         Stage.ANALYSE: progress.has_results,

@@ -113,6 +113,14 @@ ART: Final = {
         '<circle cx="21" cy="24" r="3" fill="{tint}" stroke="{accent}" '
         'stroke-width="1.6"/>'
     ),
+    "rdw": (
+        '<rect x="5" y="5" width="38" height="38" fill="{tint}" stroke="{accent}" '
+        'stroke-width="1.6"/>'
+        '<path d="M14 40 C 12 28, 18 16, 30 12 C 38 16, 38 30, 32 40 Z" fill="#fff" '
+        'stroke="{accent}" stroke-width="2.2" stroke-linejoin="round"/>'
+        '<path d="M22 27 H 30 M26 23 V 31" stroke="{accent}" stroke-width="2" '
+        'stroke-linecap="round"/>'
+    ),
 }
 """The drawings on a 48-unit square, by the tile they stand on."""
 

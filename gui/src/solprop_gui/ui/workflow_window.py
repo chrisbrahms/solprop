@@ -61,6 +61,7 @@ from solprop_gui.ui.home import HomePage
 from solprop_gui.ui.identity import LINKS, AboutDialog
 from solprop_gui.ui.machines_dialog import MachinesDialog
 from solprop_gui.ui.machines_hub import MachineStore
+from solprop_gui.ui.rdw_stage import RdwStage
 from solprop_gui.ui.run_panel import RunPanel
 from solprop_gui.ui.runs_window import RunsWindow
 from solprop_gui.ui.scan_stage import ScanStage
@@ -169,18 +170,27 @@ class WorkflowWindow(QMainWindow):
         self.sheet = SheetStage()
         self.analyse = AnalyseStage(self.session, self.run_panel, self.page_views)
         self.design = DesignStage(self.bridge)
+        self.rdw = RdwStage(self.bridge)
         self.scans = ScanStage()
 
         self.stack = QStackedWidget()
         self.screens: dict[Stage, QWidget] = {
             Stage.HOME: self.home,
             Stage.DESIGN: self.design,
+            Stage.RDW: self.rdw,
             Stage.SETUP: self.sheet,
             Stage.RUN: self.analyse,
             Stage.ANALYSE: self.analyse,
             Stage.SCAN: self.scans,
         }
-        for screen in (self.home, self.design, self.sheet, self.analyse, self.scans):
+        for screen in (
+            self.home,
+            self.design,
+            self.rdw,
+            self.sheet,
+            self.analyse,
+            self.scans,
+        ):
             self.stack.addWidget(screen)
         self.drawer = self._make_drawer()
         self.top = self._make_top()
@@ -201,6 +211,8 @@ class WorkflowWindow(QMainWindow):
 
         self.home.class_chosen.connect(self.begin_class)
         self.home.design_chosen.connect(lambda: self.show_stage(Stage.DESIGN))
+        self.home.rdw_chosen.connect(lambda: self.show_stage(Stage.RDW))
+        self.rdw.recipe_changed.connect(self._refresh)
         self.home.open_results_wanted.connect(self.choose_results)
         self.home.open_setup_wanted.connect(self.choose_setup)
         self.home.results_chosen.connect(self.open_results)
@@ -473,7 +485,7 @@ class WorkflowWindow(QMainWindow):
         self.top.setVisible(
             self.stage is not Stage.HOME or progress.has_setup or progress.has_results
         )
-        designing = self.stage is Stage.DESIGN
+        designing = self.stage in (Stage.DESIGN, Stage.RDW)
         for stage, button in self.stage_buttons.items():
             button.setVisible(not designing or stage is Stage.HOME)
             button.setEnabled(stage_open(stage, progress))
@@ -481,14 +493,23 @@ class WorkflowWindow(QMainWindow):
             repolish(button)
         primary = primary_action(progress)
         self.primary.setText("Simulate this" if designing else primary.text)
-        self.primary.setEnabled(designing or primary.enabled)
+        self.primary.setEnabled(
+            self.rdw.simulate_text() is not None
+            if self.stage is Stage.RDW
+            else designing or primary.enabled
+        )
         if self.stage is Stage.SCAN and not progress.running:
             self.primary.setText("Run scan")
             self.primary.setEnabled(progress.can_run and self.scans.has_points())
         self.overflow.setVisible(not designing)
         if designing:
-            self.context.setText("Design a waveguide")
-            self.setWindowTitle("Design a waveguide — solprop")
+            what = (
+                "Design an RDW system"
+                if self.stage is Stage.RDW
+                else "Design a waveguide"
+            )
+            self.context.setText(what)
+            self.setWindowTitle(f"{what} — solprop")
             return
         model = self.document.model
         name = None if model is None else model.title
@@ -520,6 +541,9 @@ class WorkflowWindow(QMainWindow):
         """Do what the primary button says."""
         if self.stage is Stage.DESIGN:
             self.simulate_design()
+            return
+        if self.stage is Stage.RDW:
+            self.simulate_rdw()
             return
         if self.stage is Stage.SCAN and not self.run_panel.active:
             self._scanning = True
@@ -628,6 +652,7 @@ class WorkflowWindow(QMainWindow):
             self._ask_kernel("check", {"text": str(reply.value)}, f"warmed-{purpose}")
         elif purpose == "gases" and reply.ok:
             self.design.set_gases(reply.value)  # pyright: ignore[reportArgumentType]
+            self.rdw.set_gases(reply.value)  # pyright: ignore[reportArgumentType]
             self.sheet.set_list("gases", reply.value)  # pyright: ignore[reportArgumentType]
             self._build_sheet()
         elif purpose == "run options" and reply.ok:
@@ -843,6 +868,12 @@ class WorkflowWindow(QMainWindow):
         """Carry the design to a new sheet, asking first about unsaved changes."""
         if self.design.text is not None:
             self.document.open_text(self.design.text, None)
+
+    def simulate_rdw(self) -> None:
+        """Carry the picked RDW design to a new sheet, as :meth:`simulate_design`."""
+        text = self.rdw.simulate_text()
+        if text is not None:
+            self.document.open_text(text, None)
 
     def choose_setup(self) -> None:
         """Pick a setup file and open it."""

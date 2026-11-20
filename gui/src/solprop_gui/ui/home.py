@@ -107,6 +107,8 @@ class HomePage(QWidget):
         Emitted with a problem class's key.
     design_chosen : Signal
         Emitted when the person asks to design a waveguide.
+    rdw_chosen : Signal
+        Emitted when the person asks to design an RDW system.
     open_results_wanted : Signal
         Emitted when a results file is to be picked.
     open_setup_wanted : Signal
@@ -123,6 +125,7 @@ class HomePage(QWidget):
 
     class_chosen = Signal(str)
     design_chosen = Signal()
+    rdw_chosen = Signal()
     open_results_wanted = Signal()
     open_setup_wanted = Signal()
     results_chosen = Signal(str)
@@ -155,6 +158,16 @@ class HomePage(QWidget):
         design.clicked.connect(self.design_chosen)
         self.tiles["design"] = design
         tiles.addWidget(design, after // 2, after % 2)
+        rdw = _Clickable(
+            "tile",
+            "Design an RDW system",
+            "Core radius and pulse energy for a dispersive wave, with the windows "
+            "and mirrors, before any run.",
+            art="rdw",
+        )
+        rdw.clicked.connect(self.rdw_chosen)
+        self.tiles["rdw"] = rdw
+        tiles.addWidget(rdw, (after + 1) // 2, (after + 1) % 2)
         main.addLayout(tiles)
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
