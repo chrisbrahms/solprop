@@ -53,9 +53,10 @@ constraint is ``{"type": "none"}``, ``{"type": "fixed", "distance": m}``,
 ``s_fluence``, ``conversion``, ``elastic_limit``, ``s_break``, ``fwhm_override``), and
 the option ``"preset"``: a key of :func:`~solprop.tools.rdw_space.window_presets`
 (``"SiO2"``, ...), which supplies ``material`` (its n2) and ``elastic_limit`` unless
-the constraint gives them. Besides ``inputs``: ``points`` (int), ``axes`` (optional,
-``{"a": [m, ...], "energy": [J, ...]}``, pins the view), ``soliton_term`` (optional,
-``"solprop"`` default, ``"novoa"`` or ``"none"``).
+the constraint gives them. Besides ``inputs``: ``points`` (int, 2 to 1024),
+``axes`` (optional, ``{"a": [m, ...], "energy": [J, ...]}``, each 2 to 4096 entries,
+pins the view), ``soliton_term`` (optional, ``"solprop"`` default, ``"novoa"`` or
+``"none"``).
 
 **Payload of** ``rdw_space_point``: ``inputs``, ``radius`` (m), ``energy`` (J), and
 optionally ``soliton_term``. The reply has the fields of
@@ -93,6 +94,12 @@ from solprop.tools.rdw_space import (
 )
 
 __all__ = ["BITS", "RDW_SPACE_HANDLERS", "REPLY_SCHEMA", "rdw_space", "rdw_space_point"]
+
+MAX_POINTS: Final = 1024
+"""The most grid points per axis one request may ask for."""
+
+MAX_AXIS: Final = 4096
+"""The most entries a pinned axis may have."""
 
 BITS: Final = {
     "allowed": 1,
@@ -255,11 +262,13 @@ def _axis(raw: object, path: str) -> np.ndarray:
         raise _bad(path, f"must be a list of numbers: {error}") from error
     if (
         values.ndim != 1
-        or values.size < 2
+        or not 2 <= values.size <= MAX_AXIS
         or not np.all(np.isfinite(values))
         or np.any(values <= 0)
     ):
-        raise _bad(path, "must be a 1-D list of at least two positive finite numbers")
+        raise _bad(
+            path, f"must be a 1-D list of 2 to {MAX_AXIS} positive finite numbers"
+        )
     return values
 
 
@@ -285,8 +294,14 @@ def rdw_space(payload: Payload) -> dict[str, object]:
     """
     inputs = _inputs(payload.get("inputs"))
     points = payload.get("points")
-    if isinstance(points, bool) or not isinstance(points, int) or points < 2:
-        raise _bad("points", f"must be an integer of at least 2, got {points!r}")
+    if (
+        isinstance(points, bool)
+        or not isinstance(points, int)
+        or not 2 <= points <= MAX_POINTS
+    ):
+        raise _bad(
+            "points", f"must be an integer from 2 to {MAX_POINTS}, got {points!r}"
+        )
     _, space = _space_for(payload)
     axes = None
     if payload.get("axes") is not None:
@@ -301,6 +316,12 @@ def rdw_space(payload: Payload) -> dict[str, object]:
         raise
     except (ValueError, RuntimeError) as error:
         raise _bad("inputs", str(error)) from error
+    except ArithmeticError as error:
+        raise _bad(
+            "inputs, axes",
+            "the design space is outside the range the model can evaluate "
+            f"({type(error).__name__}: {error})",
+        ) from error
     ratios = result.ratios
     flags = ratios.allowed.astype(np.uint8) * BITS["allowed"]
     for name, mask in result.masks.items():
@@ -417,16 +438,22 @@ def rdw_space_point(payload: Payload) -> dict[str, object]:
     term, space = _space_for(payload)
     try:
         point = space.point(inputs, radius, energy)
+        out: dict[str, Any] = dict(point)
+        out["flags"] = list(point["flags"])  # pyright: ignore[reportArgumentType]
+        check, note = _check(inputs, term, out)
+        out["rdw_check"] = check
+        out["rdw_check_note"] = note
+        out["recipe_text"] = _recipe_text(inputs, out)
     except SolpropError:
         raise
     except (ValueError, RuntimeError) as error:
         raise _bad("inputs", str(error)) from error
-    out: dict[str, Any] = dict(point)
-    out["flags"] = list(point["flags"])  # pyright: ignore[reportArgumentType]
-    check, note = _check(inputs, term, out)
-    out["rdw_check"] = check
-    out["rdw_check_note"] = note
-    out["recipe_text"] = _recipe_text(inputs, out)
+    except ArithmeticError as error:
+        raise _bad(
+            "radius, energy",
+            f"radius={radius!r} m, energy={energy!r} J: the design point is outside "
+            f"the range the model can evaluate ({type(error).__name__}: {error})",
+        ) from error
     return out
 
 

@@ -18,8 +18,14 @@ from solprop.exceptions import SolpropError
 from solprop.recipe import Recipe
 from solprop.recipe.quantity import Unit, parse_quantity
 from solprop.service import handlers
-from solprop.service.rdw_space import BITS, REPLY_SCHEMA, rdw_space, rdw_space_point
-from solprop.tools.rdw_space import window_presets
+from solprop.service.rdw_space import (
+    BITS,
+    REPLY_SCHEMA,
+    _inputs,
+    rdw_space,
+    rdw_space_point,
+)
+from solprop.tools.rdw_space import RdwSpace, window_presets
 
 NONE = {"type": "none"}
 INPUTS: dict[str, Any] = {
@@ -298,3 +304,76 @@ def test_a_bad_point_is_refused_naming_the_field() -> None:
         payload = {"inputs": INPUTS, "radius": 1e-4, "energy": 1e-4, **patch}
         with pytest.raises(SolpropError, match=field):
             rdw_space_point(payload)
+
+
+@pytest.mark.parametrize("points", [1, 1025, 10**9])
+def test_points_are_capped(points: int) -> None:
+    with pytest.raises(SolpropError, match="points"):
+        rdw_space({"inputs": INPUTS, "points": points})
+
+
+@pytest.mark.parametrize("name", ["a", "energy"])
+def test_a_pinned_axis_is_capped(name: str) -> None:
+    axes = {"a": [1e-4, 2e-4], "energy": [1e-4, 2e-4]}
+    axes[name] = list(np.linspace(1e-4, 2e-4, 4097))
+    with pytest.raises(SolpropError, match=re.escape(f"axes.{name}")):
+        rdw_space({"inputs": INPUTS, "points": 8, "axes": axes})
+
+
+def test_an_arithmetic_failure_is_a_readable_error() -> None:
+    # radius 1 m: the zero-dispersion search of the point divides by zero.
+    payload = {"inputs": INPUTS, "radius": 1.0, "energy": 1e-4}
+    with pytest.raises(SolpropError, match=r"radius=1\.0 m") as raised:
+        rdw_space_point(payload)
+    assert isinstance(raised.value.__cause__, ArithmeticError)
+
+
+def test_an_arithmetic_failure_of_a_map_is_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise ZeroDivisionError("division by zero")
+
+    monkeypatch.setattr(RdwSpace, "compute", boom)
+    with pytest.raises(SolpropError, match="outside the range") as raised:
+        rdw_space({"inputs": INPUTS, "points": 8})
+    assert isinstance(raised.value.__cause__, ZeroDivisionError)
+
+
+@pytest.mark.medium
+def test_orientation_and_bits_follow_the_direct_computation() -> None:
+    radii = np.geomspace(2e-6, 5e-4, 7)
+    energies = np.geomspace(1e-6, 1e-2, 5)
+    reply = space(axes={"a": radii.tolist(), "energy": energies.tolist()})
+    direct = RdwSpace().compute(_inputs(INPUTS), 0, axes=(radii, energies))
+    assert reply["shape"] == [5, 7]
+    np.testing.assert_array_equal(reply["a"], radii)
+    np.testing.assert_array_equal(reply["energy"], energies)
+    for name in ("loss", "fiss", "nmin", "nmax", "flags"):
+        assert reply[name].shape == (5, 7)
+    np.testing.assert_array_equal(reply["loss"], direct.ratios.loss.astype(np.float32))
+    np.testing.assert_array_equal(reply["nmax"], direct.ratios.nmax.astype(np.float32))
+    expected = {"allowed": direct.ratios.allowed, **direct.masks}
+    populated = []
+    for name, bit in BITS.items():
+        want = np.asarray(expected[name], dtype=bool)
+        np.testing.assert_array_equal((reply["flags"] & bit) != 0, want, err_msg=name)
+        if want.any():
+            populated.append(name)
+    # normal_dispersion cannot be made non-empty with a natural input here.
+    assert set(populated) == {"allowed", "no_root", "no_soliton", "beyond_eos"}
+    assert (
+        np.argwhere(reply["flags"] & 1).tolist()
+        == np.argwhere(direct.ratios.allowed).tolist()
+    )
+
+
+def test_the_bits_are_the_documented_ones() -> None:
+    assert [BITS[n] for n in BITS] == [1, 2, 4, 8, 16]
+    assert list(BITS) == [
+        "allowed",
+        "normal_dispersion",
+        "no_root",
+        "no_soliton",
+        "beyond_eos",
+    ]
