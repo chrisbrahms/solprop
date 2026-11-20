@@ -26,6 +26,7 @@ depend on tier-3 inputs, a change of those can move the axes and so rerun tier 2
 
 import functools
 import math
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from types import MappingProxyType
@@ -35,7 +36,13 @@ import numpy as np
 from jaxtyping import Bool, Float
 
 from solprop import physdata
-from solprop.exceptions import MaterialError, NoZeroDispersionError
+from solprop.exceptions import (
+    DiluteScalingWarning,
+    MaterialError,
+    MaterialRangeWarning,
+    NoZeroDispersionError,
+    ToolsError,
+)
 from solprop.modes import MarcatiliMode, zdw
 from solprop.tools.rdw_space._axes import auto_axes, span
 from solprop.tools.rdw_space.constants import (
@@ -70,6 +77,9 @@ _CRITICAL_POWER_FACTOR = 1.86225
 _ZDW_LONGEST = 3e-6
 _MASK_NAMES = ("normal_dispersion", "no_root", "no_soliton")
 _BEYOND_EOS = "beyond_eos"
+# Warnings about the gas data that a cached tier 1 repeats, so each call says them.
+_DATA_WARNINGS: tuple[type[Warning], ...] = (MaterialRangeWarning, DiluteScalingWarning)
+type _Kept = tuple[tuple[type[Warning], str], ...]
 # Auto axes: an edge the allowed region touches moves out by this factor, so often.
 _WIDEN = 1.5
 _WIDEN_PASSES = 3
@@ -266,7 +276,7 @@ class RdwSpace:
 
     def __init__(self, term: SolitonTerm = DEFAULT_SOLITON_TERM) -> None:
         self._term = term
-        self._tier1: tuple[tuple[object, ...], GasConstants] | None = None
+        self._tier1: tuple[tuple[object, ...], GasConstants, _Kept] | None = None
         self._table: tuple[str, float, Callable[..., np.ndarray]] | None = None
         self._tier2: (
             tuple[tuple[object, ...], Solved, np.ndarray, np.ndarray] | None
@@ -277,20 +287,63 @@ class RdwSpace:
         ) = None
 
     def _constants(self, inputs: SpaceInputs) -> tuple[GasConstants, bool]:
-        """Return the tier-1 constants and whether they were computed now."""
+        """Return the tier-1 constants and whether they were computed now.
+
+        The gas data's own warnings (:class:`~solprop.exceptions.MaterialRangeWarning`,
+        :class:`~solprop.exceptions.DiluteScalingWarning`) raised while computing them
+        are kept with them and raised again on every call that reuses them, so a
+        cached call warns as the first one did.
+
+        Raises :class:`~solprop.exceptions.ToolsError` with ``parameter="gas"`` if
+        solprop has no single-gas data for the gas (a mixture such as air), and with
+        ``parameter="wavelength_target"`` if no positive density phase-matches the
+        target (``dbeta_rho <= 0``: the gas's index at the target is below what the
+        pump needs, as past a resonance or below the gas data's range).
+        """
         key = (inputs.gas, inputs.wavelength_target, inputs.wavelength_pump)
         key += (inputs.kind, inputs.n, inputs.m)
         if self._tier1 is not None and self._tier1[0] == key:
+            for category, message in self._tier1[2]:
+                warnings.warn(message, category, stacklevel=3)
             return self._tier1[1], False
-        c = gas_constants(
-            inputs.gas,
-            inputs.wavelength_target,
-            inputs.wavelength_pump,
-            kind=inputs.kind,
-            n=inputs.n,
-            m=inputs.m,
-        )
-        self._tier1 = (key, c)
+        with warnings.catch_warnings(record=True) as caught:
+            for category in _DATA_WARNINGS:
+                warnings.simplefilter("always", category)
+            try:
+                c = gas_constants(
+                    inputs.gas,
+                    inputs.wavelength_target,
+                    inputs.wavelength_pump,
+                    kind=inputs.kind,
+                    n=inputs.n,
+                    m=inputs.m,
+                )
+            except MaterialError as error:
+                reason = str(error).split(";", 1)[0]
+                msg = (
+                    f"{inputs.gas!r} cannot be designed for: the design space needs "
+                    "one gas with its own Kerr coefficient, dispersion and ionisation "
+                    f"potential, and solprop's data refuses it ({reason}); choose a "
+                    "single gas"
+                )
+                raise ToolsError(msg, parameter="gas") from error
+        kept: list[tuple[type[Warning], str]] = []
+        for record in caught:
+            if issubclass(record.category, _DATA_WARNINGS):
+                kept.append((record.category, str(record.message)))
+            warnings.warn_explicit(
+                record.message, record.category, record.filename, record.lineno
+            )
+        if not c.dbeta_rho > 0.0:
+            msg = (
+                f"no density of {inputs.gas} phase-matches a dispersive wave at "
+                f"{inputs.wavelength_target * 1e9:.4g} nm from a "
+                f"{inputs.wavelength_pump * 1e9:.4g} nm pump: the gas's dispersion "
+                "there gives a negative phase-matching density (the target is past a "
+                "resonance of the gas, or below the range of its data)"
+            )
+            raise ToolsError(msg, parameter="wavelength_target")
+        self._tier1 = (key, c, tuple(kept))
         return c, True
 
     def _pressure(
@@ -458,7 +511,7 @@ class RdwSpace:
 
     def point(
         self, inputs: SpaceInputs, a: float, energy: float
-    ) -> dict[str, float | str | list[str] | None]:
+    ) -> dict[str, float | bool | str | list[str] | None]:
         """Return every design number at one point, for a readout.
 
         The same functions as :meth:`compute` on a one-point grid, except that the
@@ -487,7 +540,16 @@ class RdwSpace:
             ``l_fiss`` ``sqrt(L_D L_NL)``, ``l_loss`` ``a^3/alpha_bar``;
             ``hcf_length`` the length the fibre needs, ``S_fiss l_fiss``; ``d_in``,
             ``d_out`` the constraint distances (infinite where no window exists);
-            ``total_length`` ``hcf_length + d_in + d_out``; ``intensity`` the peak
+            ``total_length`` ``hcf_length + d_in + d_out``; ``available_length``
+            ``max(max_length - d_in - d_out, 0)``, the fibre length the constraints
+            leave (as :meth:`compute`'s ``flength``); ``ratio_loss``, ``ratio_fiss``,
+            ``ratio_nmin``, ``ratio_nmax`` the four design ratios of
+            :func:`.limits.ratios` (below 1 is fine; ``inf`` where no length is
+            left); ``allowed`` (bool) whether the point is a design, as
+            :meth:`compute`'s allowed region (all four ratios below 1, a soliton, a
+            pressure); ``p0`` the sech peak power ``E / (2 T0)`` (W) and ``gamma``
+            the nonlinear coefficient at the pump (rad/(W m)) that the solve used;
+            ``intensity`` the peak
             ``P0 / (aeff0 a^2)`` (W/m^2); ``i_crit`` ``P_crit / (aeff0 a^2)`` with
             ``P_crit = 1.86225 lambda0^2 / (4 pi n2)``, ``n2 = n2_0 rho`` (HiSol
             ``Limits.critical_intensity``, Fibich and Gaeta factor); ``i_supp`` the
@@ -515,7 +577,7 @@ class RdwSpace:
                 pressure = physdata.pressure(c.gas, rho)
             except MaterialError:
                 beyond = True
-        out: dict[str, float | str | list[str] | None] = {
+        out: dict[str, float | bool | str | list[str] | None] = {
             "radius": float(a),
             "energy": float(energy),
             "pressure": _finite_or_none(pressure),
@@ -533,6 +595,7 @@ class RdwSpace:
         out["l_loss"] = float(loss_length(c, radii)[0])
         out["hcf_length"] = _finite_or_none(inputs.s_fiss * l_fiss)
         lengths = inputs.s_fiss * l_fiss
+        ends = 0.0
         for end, constraint in (
             ("in", inputs.input_constraint),
             ("out", inputs.output_constraint),
@@ -543,11 +606,33 @@ class RdwSpace:
                 got = {key: np.asarray(math.nan) for key in got}
             out[f"d_{end}"] = _finite_or_none(got["distance"])
             lengths += float(got["distance"])
+            ends += float(got["distance"])
             if isinstance(constraint, WindowConstraint):
                 out[f"window_thickness_{end}"] = _finite_or_none(got["thickness"])
             if isinstance(constraint, DamageConstraint):
                 out[f"mirror_beam_radius_{end}"] = _finite_or_none(got["beam_radius"])
         out["total_length"] = _finite_or_none(lengths)
+        # As compute's flength; NaN beyond the equation of state stays NaN.
+        available = float(np.maximum(inputs.max_length - ends, 0.0))
+        out["available_length"] = _finite_or_none(available)
+        # The four ratios as compute gives them, on a one-point grid.
+        with np.errstate(divide="ignore"):
+            point_ratios = ratios(
+                c,
+                solved,
+                radii,
+                inputs.fwhm,
+                np.array([[available]]),
+                s_sf=inputs.s_sf,
+                s_ion=inputs.s_ion,
+                s_loss=inputs.s_loss,
+                s_fiss=inputs.s_fiss,
+            )
+        for name in ("loss", "fiss", "nmin", "nmax"):
+            out[f"ratio_{name}"] = _finite_or_none(getattr(point_ratios, name)[0, 0])
+        out["allowed"] = bool(point_ratios.allowed[0, 0]) and not beyond
+        out["p0"] = float(solved.p0[0, 0])
+        out["gamma"] = _finite_or_none(solved.gamma[0, 0])
         area = c.aeff0 * a**2
         out["intensity"] = float(solved.p0[0, 0]) / area
         p_crit = (

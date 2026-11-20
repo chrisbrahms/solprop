@@ -5,12 +5,14 @@
 """Tests of the tiered orchestration of the RDW design space."""
 
 import math
+import warnings
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from solprop import physdata
+from solprop.exceptions import MaterialRangeWarning, ToolsError
 from solprop.tools.rdw_space import (
     DamageConstraint,
     FixedConstraint,
@@ -212,7 +214,8 @@ def test_point_equals_grid_at_a_grid_point():
     assert raw["flags"] == []
     # Every number exists at an allowed point.
     point = {key: value for key, value in raw.items() if isinstance(value, float)}
-    assert set(raw) - set(point) == {"flags"}
+    assert set(raw) - set(point) == {"flags", "allowed"}
+    assert raw["allowed"] is True
     solved, r = result.solved, result.ratios
     exact = {
         "density": solved.rho[i, j],
@@ -240,6 +243,16 @@ def test_point_equals_grid_at_a_grid_point():
         point["hcf_length"] + point["d_in"] + point["d_out"],
         rtol=1e-12,
     )
+    # The point's own ratios and available length are the grid's.
+    for name in ("loss", "fiss", "nmin", "nmax"):
+        np.testing.assert_allclose(
+            point[f"ratio_{name}"], getattr(r, name)[i, j], rtol=1e-12, err_msg=name
+        )
+    np.testing.assert_allclose(
+        point["available_length"], result.flength[i, j], rtol=1e-12
+    )
+    np.testing.assert_allclose(point["p0"], solved.p0[i, j], rtol=1e-12)
+    np.testing.assert_allclose(point["gamma"], solved.gamma[i, j], rtol=1e-12)
     # Exact equation of state at the point against the table on the grid.
     np.testing.assert_allclose(point["pressure"], result.pressure[i, j], rtol=2e-4)
     assert point["mirror_beam_radius_in"] > 0
@@ -253,6 +266,8 @@ def test_point_readout_keys():
         "radius", "energy", "pressure", "density", "rho_a2", "dbeta_nl", "n",
         "n_min", "n_max", "l_fiss", "l_loss", "hcf_length", "d_in", "d_out",
         "total_length", "intensity", "i_crit", "i_supp", "zdw", "beta2", "flags",
+        "available_length", "ratio_loss", "ratio_fiss", "ratio_nmin", "ratio_nmax",
+        "allowed", "p0", "gamma",
     }  # fmt: skip
     assert set(point) == expected
 
@@ -264,6 +279,43 @@ def test_masked_point_reports_flags_and_no_numbers():
     assert point["flags"] == ["no_root"]
     for key in ("pressure", "density", "n", "n_max", "l_fiss", "hcf_length", "zdw"):
         assert point[key] is None, key
+    assert point["allowed"] is False
+    for key in ("ratio_loss", "ratio_fiss", "ratio_nmin", "ratio_nmax", "gamma"):
+        assert point[key] is None, key
+
+
+def test_a_point_with_no_length_left_is_not_allowed_and_says_why():
+    preset = window_presets()["SiO2"]
+    window = WindowConstraint(800e-9, preset.n2, elastic_limit=preset.elastic_limit)
+    inputs = _inputs(input_constraint=window, output_constraint=window)
+    point = RdwSpace().point(inputs, 250e-6, 1e-3)
+    assert point["flags"] == []
+    assert point["allowed"] is False
+    assert point["available_length"] == 0.0
+    assert point["ratio_fiss"] == math.inf
+    assert float(point["total_length"]) > MAX_LENGTH  # pyright: ignore[reportArgumentType]
+
+
+def test_a_target_no_density_phase_matches_is_refused_naming_it():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MaterialRangeWarning)
+        with pytest.raises(ToolsError, match="no density of He") as raised:
+            RdwSpace().compute(_inputs(wavelength_target=50e-9), 8)
+    assert raised.value.parameter == "wavelength_target"
+
+
+def test_a_gas_without_single_gas_data_is_refused_naming_it():
+    with pytest.raises(ToolsError, match="choose a single gas") as raised:
+        RdwSpace().compute(_inputs(gas="Air"), 8)
+    assert raised.value.parameter == "gas"
+
+
+def test_a_cached_tier_1_repeats_the_gas_data_warnings():
+    space = RdwSpace()
+    inputs = _inputs(gas="SF6", wavelength_target=200e-9)
+    for _ in range(2):
+        with pytest.warns(MaterialRangeWarning, match="SF6"):
+            space.compute(inputs, 8)
 
 
 def test_grid_pressure_matches_the_equation_of_state():

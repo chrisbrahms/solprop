@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from solprop.exceptions import SolpropError
+from solprop.modes import MarcatiliMode
 from solprop.recipe import Recipe
 from solprop.recipe.quantity import Unit, parse_quantity
 from solprop.service import handlers
@@ -170,12 +171,14 @@ def test_a_window_preset_is_its_numbers() -> None:
     np.testing.assert_array_equal(one["fiss"], two["fiss"])
 
 
-def _point(term: str = "solprop", **inputs: Any) -> dict[str, Any]:
+def _point(
+    term: str = "solprop", *, energy: float = 100e-6, **inputs: Any
+) -> dict[str, Any]:
     return rdw_space_point(  # pyright: ignore[reportReturnType]
         {
             "inputs": {**INPUTS, **inputs},
             "radius": 125e-6,
-            "energy": 100e-6,
+            "energy": energy,
             "soliton_term": term,
         }
     )
@@ -195,6 +198,146 @@ def test_a_point_gives_a_recipe_that_reads_back() -> None:
     assert parse_quantity(f"{point['radius']:.10g} m", Unit("m"), path="r") == (
         pytest.approx(125e-6)
     )
+
+
+@pytest.mark.medium
+def test_the_recipe_is_the_point_with_a_sech_pulse() -> None:
+    # The canonical case: what Simulate this runs is what the map designed.
+    point = _point(energy=250e-6)
+    keywords = Recipe.loads(point["recipe_text"]).keywords()
+    assert keywords["shape"] == "sech"
+    assert keywords["radius"] == pytest.approx(point["radius"], rel=1e-9)
+    assert keywords["pressure"] == pytest.approx(point["pressure"], rel=1e-9)
+    assert keywords["energy"] == pytest.approx(point["energy"], rel=1e-9)
+    assert keywords["length"] == pytest.approx(point["hcf_length"], rel=1e-9)
+    assert keywords["fwhm"] == pytest.approx(INPUTS["fwhm"], rel=1e-9)
+    assert keywords["wavelength"] == pytest.approx(INPUTS["wavelength_pump"])
+    assert keywords["modes"] == 1  # HE11
+    assert point["recipe_note"] is None
+
+
+@pytest.mark.medium
+@pytest.mark.parametrize(("kind", "n", "m"), [("HE", 1, 2), ("TE", 0, 1)])
+def test_the_recipe_propagates_the_design_mode_alone(kind: str, n: int, m: int) -> None:
+    point = _point(energy=250e-6, kind=kind, n=n, m=m)
+    assert point["flags"] == []
+    recipe = Recipe.loads(point["recipe_text"])
+    modes = recipe.keywords()["modes"]
+    assert isinstance(modes, list)
+    assert [(mode.kind, mode.n, mode.m) for mode in modes] == [(kind, n, m)]
+    assert modes[0].radius == pytest.approx(point["radius"], rel=1e-9)
+    assert f"{kind}{n}{m}" in point["recipe_note"]
+    # The run is built on that one mode (a pure-Python backend: nothing runs).
+    recipe.set("backend", "numpy_ref")
+    built = recipe.build().modes
+    assert len(built) == 1
+    assert isinstance(built[0], MarcatiliMode)
+    assert (built[0].kind, built[0].n, built[0].m) == (kind, n, m)
+
+
+def _unmasked(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Return the point reply at a cell of the map with no mask set."""
+    reply = space(inputs)
+    i, j = np.argwhere(reply["flags"] & ~np.uint8(BITS["allowed"]) == 0)[0]
+    return rdw_space_point(  # pyright: ignore[reportReturnType]
+        {
+            "inputs": inputs,
+            "radius": float(reply["a"][j]),
+            "energy": float(reply["energy"][i]),
+        }
+    )
+
+
+@pytest.mark.medium
+@pytest.mark.parametrize(("pump", "target"), [(1030e-9, 120e-9), (1800e-9, 200e-9)])
+def test_the_recipe_window_holds_the_target_and_the_pump(
+    pump: float, target: float
+) -> None:
+    point = _unmasked({**INPUTS, "wavelength_pump": pump, "wavelength_target": target})
+    keywords = Recipe.loads(point["recipe_text"]).keywords()
+    low, high = keywords["wavelength_limits"]  # pyright: ignore[reportGeneralTypeIssues]
+    assert low <= 0.5 * target * (1 + 1e-9)
+    assert high > pump
+    assert keywords["wavelength"] == pytest.approx(pump)
+
+
+@pytest.mark.medium
+def test_the_recipe_time_window_follows_the_fwhm() -> None:
+    short = Recipe.loads(_point(energy=250e-6)["recipe_text"]).keywords()
+    long = _point(energy=250e-6, fwhm=30e-15)
+    assert long["flags"] == []
+    assert short["trange"] == pytest.approx(200e-15)  # the example's, 20 x 10 fs
+    trange = Recipe.loads(long["recipe_text"]).keywords()["trange"]
+    assert trange == pytest.approx(20 * 30e-15)
+
+
+@pytest.mark.medium
+def test_a_point_says_whether_it_is_allowed() -> None:
+    good = _point(energy=250e-6)
+    assert good["allowed"] is True
+    ratios = [good[f"ratio_{name}"] for name in ("loss", "fiss", "nmin", "nmax")]
+    assert all(0 < ratio < 1 for ratio in ratios)
+    assert good["available_length"] == pytest.approx(INPUTS["max_length"])
+    window = {"type": "window", "wavelength_ref": 800e-9, "preset": "SiO2"}
+    bad = rdw_space_point(
+        {
+            "inputs": {
+                **INPUTS,
+                "input_constraint": window,
+                "output_constraint": window,
+            },
+            "radius": 250e-6,
+            "energy": 1e-3,
+        }
+    )
+    assert bad["allowed"] is False
+    assert bad["available_length"] == 0.0
+    assert bad["ratio_fiss"] == np.inf
+    # A point outside the region still has its recipe: the user may simulate it.
+    assert bad["recipe_text"] is not None
+
+
+@pytest.mark.medium
+def test_the_check_uses_the_point_peak_power_and_gamma() -> None:
+    point = _point(energy=250e-6)
+    t0 = INPUTS["fwhm"] / (2 * np.arccosh(np.sqrt(2)))
+    assert point["p0"] == pytest.approx(250e-6 / (2 * t0), rel=1e-12)
+    assert point["gamma"] > 0
+
+
+@pytest.mark.medium
+def test_gas_data_outside_its_range_is_a_note_every_time() -> None:
+    inputs = {**INPUTS, "gas": "SF6", "wavelength_target": 200e-9}
+    first = space(inputs)
+    again = space(inputs)
+    assert again["tiers"] == []
+    for reply in (first, again):
+        assert len(reply["notes"]) == 1
+        assert "SF6" in reply["notes"][0]
+    assert space()["notes"] == []
+    assert _point()["notes"] == []
+
+
+@pytest.mark.parametrize(
+    ("patch", "field"),
+    [
+        ({"wavelength_target": 50e-9}, "inputs.wavelength_target"),
+        ({"gas": "Ar", "wavelength_target": 100e-9}, "inputs.wavelength_target"),
+        ({"gas": "Air", "wavelength_target": 200e-9}, "inputs.gas"),
+    ],
+)
+def test_inputs_with_no_design_name_the_input(
+    patch: dict[str, Any], field: str
+) -> None:
+    for call in (
+        lambda: space({**INPUTS, **patch}),
+        lambda: rdw_space_point(
+            {"inputs": {**INPUTS, **patch}, "radius": 1e-4, "energy": 1e-4}
+        ),
+    ):
+        with pytest.raises(SolpropError, match=re.escape(field)) as raised:
+            call()
+        assert "must be finite" not in str(raised.value)
 
 
 @pytest.mark.medium
@@ -589,6 +732,8 @@ def test_the_soliton_terms_are_accepted_and_one_is_the_default() -> None:
     terms = options()["soliton_terms"]
     assert [t["name"] for t in terms] == ["solprop", "novoa", "none"]
     assert [t["name"] for t in terms if t["default"]] == ["solprop"]
+    novoa = next(t["label"] for t in terms if t["name"] == "novoa")
+    assert novoa == "Luna PR #425 (after Novoa et al., PRL 115, 033901 (2015))"
     for term in terms:
         assert term["label"]
         assert space(soliton_term=term["name"], points=3)["shape"] == [3, 3]

@@ -36,6 +36,10 @@ and one packed ``uint8`` grid, 4.5 MB and about 1 ms to pickle at 512 x 512.
 - ``eos_limited``: as :class:`~solprop.tools.rdw_space.SpaceResult`.
 - ``tiers``: list of the tiers that ran, ``[]`` for a repeat.
 - ``points``: the ``points`` asked for.
+- ``notes``: list of str, the warnings of solprop's gas data raised for the map
+  (:class:`~solprop.exceptions.MaterialRangeWarning`: a gas law evaluated outside the
+  range of its source; :class:`~solprop.exceptions.DiluteScalingWarning`), each once;
+  a cached map repeats them. Other warnings pass through as warnings.
 
 :data:`REPLY_SCHEMA` states the same in one dict.
 
@@ -65,24 +69,30 @@ holds no defaults of its own; see :func:`rdw_space_options`.
 **Payload of** ``rdw_space_point``: ``inputs``, ``radius`` (m), ``energy`` (J), and
 optionally ``soliton_term``. The reply has the fields of
 :meth:`~solprop.tools.rdw_space.RdwSpace.point` and ``rdw_check`` (m or ``None``),
-``rdw_check_note`` (str or ``None``) and ``recipe_text`` (str or ``None``).
+``rdw_check_note`` (str or ``None``), ``recipe_text`` (str or ``None``),
+``recipe_note`` (str or ``None``) and ``notes`` (list of str), as
+:func:`rdw_space_point` says.
 """
 
 import math
-from collections.abc import Mapping
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import MISSING, fields
 from typing import Any, Final
 
 import numpy as np
 
-from solprop import physdata
-from solprop.constants import EPS0, C
-from solprop.exceptions import SolpropError, ToolsError
+from solprop.exceptions import (
+    DiluteScalingWarning,
+    MaterialRangeWarning,
+    SolpropError,
+    ToolsError,
+)
 from solprop.modes import MarcatiliMode
 from solprop.service._payload import Payload
 from solprop.service.waveguide import design_recipe
-from solprop.tools import lambda_rdw, nonlinear_coefficient
-from solprop.tools.pulse import pulse_width
+from solprop.tools import lambda_rdw
 from solprop.tools.rdw_space import (
     Constraint,
     DamageConstraint,
@@ -134,6 +144,7 @@ REPLY_SCHEMA: Final[dict[str, Any]] = {
     "eos_limited": "bool",
     "tiers": "list of int, the tiers that ran",
     "points": "int, as asked",
+    "notes": "list of str, gas data used outside its validity, each once",
 }
 """The ``rdw_space`` reply's fields, with dtype, shape and meaning, for tests."""
 
@@ -301,7 +312,10 @@ def rdw_space(payload: Payload) -> dict[str, object]:
     ------
     solprop.exceptions.ToolsError
         If a payload field is wrong (the message names it), or the inputs have no
-        solution the physics can handle.
+        solution the physics can handle: a gas without single-gas data (air) names
+        ``inputs.gas``, and a target no positive density phase-matches (past a
+        resonance of the gas, or below the range of its data) names
+        ``inputs.wavelength_target``, with the gas data's warning as the reason.
     """
     inputs = _inputs(payload.get("inputs"))
     points = payload.get("points")
@@ -321,10 +335,15 @@ def rdw_space(payload: Payload) -> dict[str, object]:
             _axis(given.get("a"), "axes.a"),
             _axis(given.get("energy"), "axes.energy"),
         )
+    notes: list[str] = []
     try:
-        result = space.compute(inputs, points, axes=axes)
-    except SolpropError:
-        raise
+        with _noting() as notes:
+            result = space.compute(inputs, points, axes=axes)
+    except SolpropError as error:
+        named = _named(error, notes)
+        if named is error:
+            raise
+        raise named from error
     except (ValueError, RuntimeError) as error:
         raise _bad("inputs", str(error)) from error
     except ArithmeticError as error:
@@ -350,6 +369,7 @@ def rdw_space(payload: Payload) -> dict[str, object]:
         "eos_limited": bool(result.eos_limited),
         "tiers": [int(t) for t in result.computed_tiers],
         "points": points,
+        "notes": notes,
     }
 
 
@@ -358,12 +378,13 @@ def _check(
 ) -> tuple[float | None, str | None]:
     """Return the phase-matched wavelength of the point by ``lambda_rdw``, and a note.
 
-    A real reduced Marcatili mode at the point's pressure, with the point's peak power
-    and FWHM. ``None`` if the point is masked or ``lambda_rdw`` finds no root.
+    A real reduced Marcatili mode at the point's pressure, with the peak power and the
+    nonlinear coefficient the point's solve used (``p0``, ``gamma``) and its FWHM.
+    ``None`` if the point is masked or ``lambda_rdw`` finds no root.
     """
     if term == "novoa":
         return None, "solprop has no equivalent nonlinear_phase for the novoa term"
-    if point["flags"] or point["pressure"] is None:
+    if point["flags"] or point["pressure"] is None or point["gamma"] is None:
         return None, None
     mode = MarcatiliMode(
         point["radius"],
@@ -378,20 +399,11 @@ def _check(
         if term == "none":
             found = lambda_rdw(mode, inputs.wavelength_pump, nonlinear_phase="linear")
         else:
-            peak = point["energy"] / (2.0 * pulse_width(inputs.fwhm, "sech"))
-            # n2 of the fill as solprop's capillary tools take it: 3 gamma3 rho /
-            # (4 eps0 c), with gamma3 from physdata.
-            n2 = (
-                0.75
-                * physdata.gamma3(inputs.gas, wavelength=inputs.wavelength_pump)
-                * point["density"]
-                / (EPS0 * C)
-            )
             found = lambda_rdw(
                 mode,
                 inputs.wavelength_pump,
-                peak_power=peak,
-                gamma=nonlinear_coefficient(mode, n2, inputs.wavelength_pump),
+                peak_power=point["p0"],
+                gamma=point["gamma"],
                 fwhm=inputs.fwhm,
                 nonlinear_phase="largest",
             )
@@ -400,20 +412,109 @@ def _check(
     return float(found), None
 
 
-def _recipe_text(inputs: SpaceInputs, point: Mapping[str, Any]) -> str | None:
-    """Return the capillary recipe of a point, ``None`` where it has no design."""
+TRANGE_PER_FWHM: Final = 20.0
+"""The recipe's time window over the pulse FWHM (never below the example's window)."""
+
+LOWEST_PER_TARGET: Final = 0.5
+"""The recipe's shortest wavelength over the target's (or less, as the example's)."""
+
+
+def _recipe(
+    inputs: SpaceInputs, point: Mapping[str, Any]
+) -> tuple[str | None, str | None]:
+    """Return the capillary recipe of a point that reproduces the design, and a note.
+
+    The recipe is the Design page's (:func:`~solprop.service.waveguide.design_recipe`)
+    with what the map assumes written out: a sech pulse (the map's ``P0 = E/(2 T0)``);
+    the design's mode, as a one-mode set (``modes = [{type = "MarcatiliMode", ...}]``,
+    into which the pulse is launched whole) unless it is HE11 (``modes = 1``); a
+    wavelength window from at most :data:`LOWEST_PER_TARGET` times the target (or the
+    example's scaled lower limit, if lower) to at least the example's scaled upper
+    limit and 1.5 times the longer of pump and target; and a time window of
+    :data:`TRANGE_PER_FWHM` FWHMs, never shorter than the example's. ``None`` and no
+    note for a point with no design.
+    """
     if point["flags"] or point["pressure"] is None or point["hcf_length"] is None:
-        return None
-    values = {
-        "radius": f"{point['radius']:.10g} m",
+        return None, None
+    radius = f"{point['radius']:.10g} m"
+    values: dict[str, object] = {
+        "radius": radius,
         "gas": inputs.gas,
         "pressure": f"{point['pressure']:.10g} bar",
         "wavelength": f"{inputs.wavelength_pump:.10g} m",
         "fwhm": f"{inputs.fwhm:.10g} s",
         "energy": f"{point['energy']:.10g} J",
         "length": f"{point['hcf_length']:.10g} m",
+        "shape": "sech",
     }
-    return design_recipe({"guide": "capillary", "values": values}).to_text()
+    note = None
+    if (inputs.kind, inputs.n, inputs.m) != ("HE", 1, 1):
+        values["modes"] = [
+            {
+                "type": "MarcatiliMode",
+                "radius": radius,
+                "kind": inputs.kind,
+                "n": inputs.n,
+                "m": inputs.m,
+            }
+        ]
+        note = (
+            f"The recipe propagates the {inputs.kind}{inputs.n}{inputs.m} mode "
+            "alone, with the whole pulse launched into it."
+        )
+    recipe = design_recipe({"guide": "capillary", "values": values})
+    keywords = recipe.keywords()
+    low, high = (float(x) for x in keywords["wavelength_limits"])  # pyright: ignore[reportGeneralTypeIssues]
+    longest = max(inputs.wavelength_pump, inputs.wavelength_target)
+    shortest = min(inputs.wavelength_pump, inputs.wavelength_target)
+    recipe.set(
+        "wavelength_limits",
+        [
+            f"{min(low, LOWEST_PER_TARGET * shortest):.10g} m",
+            f"{max(high, 1.5 * longest):.10g} m",
+        ],
+    )
+    trange = max(float(keywords["trange"]), TRANGE_PER_FWHM * inputs.fwhm)  # pyright: ignore[reportArgumentType]
+    recipe.set("trange", f"{trange:.10g} s")
+    return recipe.to_text(), note
+
+
+_NOTED: Final = (MaterialRangeWarning, DiluteScalingWarning)
+"""The warnings a reply carries as ``notes``: gas data used outside its validity."""
+
+
+@contextmanager
+def _noting() -> Iterator[list[str]]:
+    """Collect the gas-data warnings raised inside as notes; raise the others again.
+
+    Yields the list the notes are appended to, each message once.
+    """
+    notes: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        for category in _NOTED:
+            warnings.simplefilter("always", category)
+        try:
+            yield notes
+        finally:
+            others = []
+            for record in caught:
+                if issubclass(record.category, _NOTED):
+                    if str(record.message) not in notes:
+                        notes.append(str(record.message))
+                else:
+                    others.append(record)
+    for record in others:
+        warnings.warn_explicit(
+            record.message, record.category, record.filename, record.lineno
+        )
+
+
+def _named(error: SolpropError, notes: Sequence[str]) -> SolpropError:
+    """Return a caller error naming its payload field, with the notes as the reason."""
+    if error.parameter in ("gas", "wavelength_target"):
+        reason = f" ({notes[0]})" if notes else ""
+        return _bad(f"inputs.{error.parameter}", f"{error}{reason}")
+    return error
 
 
 def rdw_space_point(payload: Payload) -> dict[str, object]:
@@ -432,13 +533,20 @@ def rdw_space_point(payload: Payload) -> dict[str, object]:
         a real reduced Marcatili mode at the point (``nonlinear_phase="linear"`` for
         the ``"none"`` term, ``"largest"`` for ``"solprop"``), ``None`` for a masked
         point, one with no root, or the ``"novoa"`` term; ``rdw_check_note``, why a
-        check is absent for ``"novoa"`` (else ``None``); and ``recipe_text``, the
-        capillary recipe of the point (``None`` for a masked point).
+        check is absent for ``"novoa"`` (else ``None``); ``recipe_text``, the
+        capillary recipe of the point (``None`` for a masked point), which carries
+        the map's sech pulse, the design's mode, and wavelength and time windows that
+        hold the target and the pulse (:func:`_recipe`); ``recipe_note``, what the
+        recipe does beyond the Design page's (the mode it propagates), else
+        ``None``; and ``notes``, the gas-data warnings raised for the point (as
+        ``rdw_space``'s).
 
     Raises
     ------
     solprop.exceptions.ToolsError
-        If a payload field is wrong; the message names it.
+        If a payload field is wrong; the message names it. A gas without single-gas
+        data names ``inputs.gas``, and a target no density phase-matches names
+        ``inputs.wavelength_target``, as for ``rdw_space``.
     """
     inputs = _inputs(payload.get("inputs"))
     radius = _number(payload.get("radius"), "radius")
@@ -447,16 +555,20 @@ def rdw_space_point(payload: Payload) -> dict[str, object]:
         if not (math.isfinite(value) and value > 0):
             raise _bad(name, f"must be positive and finite, got {value!r}")
     term, space = _space_for(payload)
+    notes: list[str] = []
     try:
-        point = space.point(inputs, radius, energy)
-        out: dict[str, Any] = dict(point)
-        out["flags"] = list(point["flags"])  # pyright: ignore[reportArgumentType]
-        check, note = _check(inputs, term, out)
-        out["rdw_check"] = check
-        out["rdw_check_note"] = note
-        out["recipe_text"] = _recipe_text(inputs, out)
-    except SolpropError:
-        raise
+        with _noting() as notes:
+            out: dict[str, Any] = dict(space.point(inputs, radius, energy))
+            out["flags"] = list(out["flags"])
+            check, check_note = _check(inputs, term, out)
+            out["rdw_check"] = check
+            out["rdw_check_note"] = check_note
+            out["recipe_text"], out["recipe_note"] = _recipe(inputs, out)
+    except SolpropError as error:
+        named = _named(error, notes)
+        if named is error:
+            raise
+        raise named from error
     except (ValueError, RuntimeError) as error:
         raise _bad("inputs", str(error)) from error
     except ArithmeticError as error:
@@ -465,6 +577,7 @@ def rdw_space_point(payload: Payload) -> dict[str, object]:
             f"radius={radius!r} m, energy={energy!r} J: the design point is outside "
             f"the range the model can evaluate ({type(error).__name__}: {error})",
         ) from error
+    out["notes"] = notes
     return out
 
 
@@ -642,7 +755,7 @@ _CONSTRAINT_LABELS: Final = {
 }
 _TERM_LABELS: Final = {
     "solprop": "solprop (half of the soliton phase)",
-    "novoa": "Novoa et al., PR A 91, 2015 (as coded in solprop)",
+    "novoa": "Luna PR #425 (after Novoa et al., PRL 115, 033901 (2015))",
     "none": "None (linear limit, HiSol)",
 }
 
