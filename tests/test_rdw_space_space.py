@@ -475,3 +475,11 @@ def test_point_past_the_equation_of_state_reports_the_flag_and_no_pressure():
     for key in ("pressure", "d_in", "d_out", "total_length", "zdw"):
         assert point[key] is None, key
     assert point["density"] is not None
+
+
+def test_point_with_a_zdw_search_that_cannot_evaluate_returns_none():
+    # A 1 m core: the dispersion is flat across the ZDW bracket and the root search
+    # divides by zero (solprop.modes.base._refine_zero).
+    out = RdwSpace().point(_inputs(), 1.0, 1e-4)
+    assert out["zdw"] is None
+    assert out["radius"] == 1.0

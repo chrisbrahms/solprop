@@ -494,11 +494,12 @@ class RdwSpace:
             barrier-suppression intensity; ``zdw`` the zero-dispersion wavelength (m)
             of a reduced :class:`~solprop.modes.MarcatiliMode` at the point's radius
             and pressure, nearest the pump between the target wavelength and 3 um, or
-            ``None`` if there is none; ``beta2`` (s^2/m) at the pump; for a window
-            constraint ``window_thickness_in`` or ``_out`` (m), for a damage constraint
-            ``mirror_beam_radius_in`` or ``_out`` (1/e^2, m); ``flags`` the names of
-            the masks set at the point (``normal_dispersion``, ``no_root``,
-            ``no_soliton``, ``beyond_eos``).
+            ``None`` if there is none or the root search cannot evaluate the dispersion
+            (an arithmetic failure, such as a flat bracket); ``beta2`` (s^2/m) at the
+            pump; for a window constraint ``window_thickness_in`` or ``_out`` (m), for
+            a damage constraint ``mirror_beam_radius_in`` or ``_out`` (1/e^2, m);
+            ``flags`` the names of the masks set at the point
+            (``normal_dispersion``, ``no_root``, ``no_soliton``, ``beyond_eos``).
         """
         c, _ = self._constants(inputs)
         radii = np.array([float(a)])
@@ -578,5 +579,7 @@ def _point_zdw(
     limits = (c.wavelength_target, max(_ZDW_LONGEST, 2.0 * c.wavelength_pump))
     try:
         return zdw(mode, wavelength_limits=limits, near=c.wavelength_pump)
-    except NoZeroDispersionError:
+    except NoZeroDispersionError, ArithmeticError:
+        # ArithmeticError: the root search divides by zero where the dispersion is
+        # flat across its bracket (solprop.modes.base._refine_zero).
         return None

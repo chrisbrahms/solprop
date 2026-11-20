@@ -320,8 +320,18 @@ def test_a_pinned_axis_is_capped(name: str) -> None:
         rdw_space({"inputs": INPUTS, "points": 8, "axes": axes})
 
 
-def test_an_arithmetic_failure_is_a_readable_error() -> None:
-    # radius 1 m: the zero-dispersion search of the point divides by zero.
+def test_a_flat_zdw_search_gives_a_reply_with_no_zdw() -> None:
+    reply = rdw_space_point({"inputs": INPUTS, "radius": 1.0, "energy": 1e-4})
+    assert reply["zdw"] is None
+
+
+def test_an_arithmetic_failure_of_a_point_is_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise ZeroDivisionError("division by zero")
+
+    monkeypatch.setattr(RdwSpace, "point", boom)
     payload = {"inputs": INPUTS, "radius": 1.0, "energy": 1e-4}
     with pytest.raises(SolpropError, match=r"radius=1\.0 m") as raised:
         rdw_space_point(payload)
