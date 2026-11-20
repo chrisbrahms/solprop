@@ -41,6 +41,7 @@ from solprop.service.design import DESIGN_HANDLERS, pin_targets
 from solprop.service.figures import FIGURE_HANDLERS
 from solprop.service.postprocess import POSTPROCESS_HANDLERS
 from solprop.service.radial_pages import BEAM_HANDLERS
+from solprop.service.rdw_space import RDW_SPACE_HANDLERS
 from solprop.service.reduce import (
     SPECTRAL_AXES,
     TIME_OVERSAMPLING,
@@ -637,6 +638,7 @@ HANDLERS: dict[str, Callable[[Payload], object]] = {
     **WAVEGUIDE_HANDLERS,
     **FIGURE_HANDLERS,
     **POSTPROCESS_HANDLERS,
+    **RDW_SPACE_HANDLERS,
     **RESULTS_HANDLERS,
 }
 """The handlers, by request kind."""
