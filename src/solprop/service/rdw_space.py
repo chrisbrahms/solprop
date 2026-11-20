@@ -58,6 +58,10 @@ the constraint gives them. Besides ``inputs``: ``points`` (int, 2 to 1024),
 pins the view), ``soliton_term`` (optional, ``"solprop"`` default, ``"novoa"`` or
 ``"none"``).
 
+**Payload of** ``rdw_space_options``: none (an empty mapping). The reply describes what
+the two requests above accept, from the dataclasses themselves, for a front end that
+holds no defaults of its own; see :func:`rdw_space_options`.
+
 **Payload of** ``rdw_space_point``: ``inputs``, ``radius`` (m), ``energy`` (J), and
 optionally ``soliton_term``. The reply has the fields of
 :meth:`~solprop.tools.rdw_space.RdwSpace.point` and ``rdw_check`` (m or ``None``),
@@ -66,7 +70,7 @@ optionally ``soliton_term``. The reply has the fields of
 
 import math
 from collections.abc import Mapping
-from dataclasses import fields
+from dataclasses import MISSING, fields
 from typing import Any, Final
 
 import numpy as np
@@ -93,7 +97,14 @@ from solprop.tools.rdw_space import (
     window_presets,
 )
 
-__all__ = ["BITS", "RDW_SPACE_HANDLERS", "REPLY_SCHEMA", "rdw_space", "rdw_space_point"]
+__all__ = [
+    "BITS",
+    "RDW_SPACE_HANDLERS",
+    "REPLY_SCHEMA",
+    "rdw_space",
+    "rdw_space_options",
+    "rdw_space_point",
+]
 
 MAX_POINTS: Final = 1024
 """The most grid points per axis one request may ask for."""
@@ -457,8 +468,285 @@ def rdw_space_point(payload: Payload) -> dict[str, object]:
     return out
 
 
+_OPTION_FIELDS: Final[dict[str, dict[str, tuple[str, str, str, str, bool]]]] = {
+    # constraint type -> field -> (label, kind, unit, help, optional_none). Written by
+    # hand as documentation, not physics; the names, defaults and which fields are
+    # required come from the dataclasses (a new field without a row fails the tests).
+    "none": {},
+    "fixed": {
+        "distance": (
+            "Distance",
+            "length",
+            "m",
+            "Free space between the fibre end and the next optic (HiSol "
+            "FixedConstraint); 0 or positive.",
+            False,
+        ),
+    },
+    "damage": {
+        "wavelength_ref": (
+            "Wavelength on mirror",
+            "wavelength",
+            "m",
+            "Wavelength of the beam on the mirror, where the damage threshold holds.",
+            False,
+        ),
+        "lidt": (
+            "Mirror LIDT",
+            "energy_density",
+            "J/m^2",
+            "Laser-induced damage threshold of the mirror; 1 J/cm2 is 1e4 J/m2.",
+            False,
+        ),
+        "s_fluence": (
+            "Fluence safety factor",
+            "number",
+            "1",
+            "Safety factor: the peak fluence stays below the threshold over this.",
+            False,
+        ),
+        "conversion": (
+            "Energy conversion",
+            "number",
+            "1",
+            "Pulse energy on the mirror over that in the fibre (for example the "
+            "conversion efficiency at the exit).",
+            False,
+        ),
+    },
+    "window": {
+        "wavelength_ref": (
+            "Wavelength for nonlinearity",
+            "wavelength",
+            "m",
+            "Wavelength at which the B-integral (and the window LIDT) is evaluated.",
+            False,
+        ),
+        "material": (
+            "Material n2",
+            "index",
+            "m^2/W",
+            "Nonlinear index of the window; or give a preset, which supplies it and "
+            "the elastic limit.",
+            False,
+        ),
+        "wavelength_max": (
+            "Longest wavelength",
+            "wavelength",
+            "m",
+            "Longest wavelength that must pass the aperture; empty: the reference "
+            "wavelength.",
+            True,
+        ),
+        "b_max": (
+            "Largest B-integral",
+            "number",
+            "1",
+            "Largest B-integral accepted in the window (HiSol window_distance).",
+            False,
+        ),
+        "thickness": (
+            "Thickness",
+            "length",
+            "m",
+            "Fixed window thickness; empty: variable, as thin as the B-integral and "
+            "the pressure allow.",
+            True,
+        ),
+        "round_thickness": (
+            "Round thickness up",
+            "rounding",
+            "mm",
+            "A variable thickness rounded up: off, whole mm, or multiples of a step "
+            "given in mm (the one field in mm, not SI).",
+            False,
+        ),
+        "aperture_radius": (
+            "Aperture radius",
+            "length",
+            "m",
+            "Fixed aperture radius; empty: variable, sized for the beam.",
+            True,
+        ),
+        "aperture_factor": (
+            "Aperture factor",
+            "number",
+            "1",
+            "Aperture radius over the 1/e^2 beam radius at the longest wavelength.",
+            False,
+        ),
+        "round_aperture": (
+            "Round aperture up",
+            "rounding",
+            "mm",
+            "As the thickness rounding, for a variable aperture radius (step in mm).",
+            False,
+        ),
+        "lidt": (
+            "Window LIDT",
+            "energy_density",
+            "J/m^2",
+            "Damage threshold of the window; empty: ignore window damage.",
+            True,
+        ),
+        "s_fluence": (
+            "Fluence safety factor",
+            "number",
+            "1",
+            "Safety factor on the window LIDT.",
+            False,
+        ),
+        "conversion": (
+            "Energy conversion",
+            "number",
+            "1",
+            "Pulse energy at the window over that in the fibre.",
+            False,
+        ),
+        "elastic_limit": (
+            "Elastic limit",
+            "pressure",
+            "Pa",
+            "Modulus of rupture of the window; needed unless a preset gives it "
+            "(solprop's physdata has none by name).",
+            True,
+        ),
+        "s_break": (
+            "Pressure safety factor",
+            "number",
+            "1",
+            "Safety factor on the pressure the window must hold.",
+            False,
+        ),
+        "fwhm_override": (
+            "Pulse FWHM override",
+            "time",
+            "s",
+            "Pulse FWHM used for the nonlinearity instead of the design's; empty: "
+            "the design's.",
+            True,
+        ),
+    },
+}
+_CONSTRAINT_CLASSES: Final[dict[str, type]] = {
+    "none": NoConstraint,
+    "fixed": FixedConstraint,
+    "damage": DamageConstraint,
+    "window": WindowConstraint,
+}
+_CONSTRAINT_LABELS: Final = {
+    "none": "None",
+    "fixed": "Fixed distance",
+    "damage": "Mirror (damage threshold)",
+    "window": "Window",
+}
+_TERM_LABELS: Final = {
+    "solprop": "solprop (half of the soliton phase)",
+    "novoa": "Novoa et al., PR A 91, 2015 (as coded in solprop)",
+    "none": "None (linear limit, HiSol)",
+}
+
+
+def _constraint_type(name: str) -> dict[str, object]:
+    """Return the options reply's entry for one constraint type."""
+    cls = _CONSTRAINT_CLASSES[name]
+    rows = _OPTION_FIELDS[name]
+    out: list[dict[str, object]] = []
+    for f in fields(cls):
+        label, kind, unit, text, optional_none = rows[f.name]
+        required = f.default is MISSING
+        out.append(
+            {
+                "name": f.name,
+                "label": label,
+                "kind": kind,
+                "unit": unit,
+                "default": None if required else f.default,
+                "required": required,
+                "optional_none": optional_none,
+                "alternative": "preset"
+                if f.name in ("material", "elastic_limit")
+                else None,
+                "help": text,
+            }
+        )
+    if name == "window":
+        out.append(
+            {
+                "name": "preset",
+                "label": "Preset material",
+                "kind": "choice",
+                "unit": "1",
+                "default": None,
+                "required": False,
+                "optional_none": False,
+                "alternative": None,
+                "help": "A key of window_presets: supplies the material n2 and the "
+                "elastic limit unless the constraint gives them.",
+            }
+        )
+    return {"name": name, "label": _CONSTRAINT_LABELS[name], "fields": out}
+
+
+def rdw_space_options(payload: Payload) -> dict[str, object]:  # noqa: ARG001
+    """Return what the design space accepts, as plain data, for a front end's form.
+
+    Everything is read from the dataclasses and :func:`window_presets`, so a front end
+    holds no default or rule of its own. The gas list is the ``gases`` request's.
+
+    Parameters
+    ----------
+    payload : Mapping
+        Unused (none, or empty).
+
+    Returns
+    -------
+    dict
+        ``constraint_types``: for each of ``none``, ``fixed``, ``damage``, ``window``
+        a dict ``name``, ``label`` and ``fields``, each field a dict of ``name``
+        (the payload key), ``label``, ``kind`` (``length``, ``wavelength``, ``time``,
+        ``energy_density``, ``pressure``, ``index`` for n2, ``number`` for a
+        dimensionless value, ``rounding`` for a flag or a step, ``choice``), ``unit``
+        (the unit of the payload's number in the grammar of
+        :class:`~solprop.recipe.quantity.Unit`: SI, ``"1"`` for a dimensionless
+        value, except ``rounding`` in mm), ``default``,
+        ``required``, ``optional_none`` (``None`` means variable or ignored),
+        ``alternative`` (the name of a field that can replace it) and ``help``;
+        ``window_presets``: a list of dicts ``name``, ``n2`` (m^2/W),
+        ``elastic_limit`` (Pa), ``source``; ``defaults``: the optional
+        :class:`~solprop.tools.rdw_space.SpaceInputs` fields with their defaults;
+        ``soliton_terms``: dicts ``name``, ``label``, ``default``; ``limits``:
+        ``points`` and ``axis_entries``, each ``{"min", "max"}``.
+    """
+    defaults = {
+        f.name: f.default for f in fields(SpaceInputs) if f.default is not MISSING
+    }
+    return {
+        "constraint_types": [_constraint_type(name) for name in _CONSTRAINT_CLASSES],
+        "window_presets": [
+            {
+                "name": name,
+                "n2": preset.n2,
+                "elastic_limit": preset.elastic_limit,
+                "source": preset.source,
+            }
+            for name, preset in window_presets().items()
+        ],
+        "defaults": defaults,
+        "soliton_terms": [
+            {"name": name, "label": _TERM_LABELS[name], "default": name == "solprop"}
+            for name in _TERMS
+        ],
+        "limits": {
+            "points": {"min": 2, "max": MAX_POINTS},
+            "axis_entries": {"min": 2, "max": MAX_AXIS},
+        },
+    }
+
+
 RDW_SPACE_HANDLERS = {
     "rdw_space": rdw_space,
+    "rdw_space_options": rdw_space_options,
     "rdw_space_point": rdw_space_point,
 }
 """The RDW design-space requests, by kind."""

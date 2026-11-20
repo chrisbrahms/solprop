@@ -5,10 +5,12 @@
 """The kernel's RDW design-space requests: the map, one point, and the wire format."""
 
 import copy
+import json
 import pickle
 import re
 import warnings
 from collections.abc import Iterator
+from dataclasses import MISSING, fields
 from typing import Any
 
 import numpy as np
@@ -23,9 +25,18 @@ from solprop.service.rdw_space import (
     REPLY_SCHEMA,
     _inputs,
     rdw_space,
+    rdw_space_options,
     rdw_space_point,
 )
-from solprop.tools.rdw_space import RdwSpace, window_presets
+from solprop.tools.rdw_space import (
+    DamageConstraint,
+    FixedConstraint,
+    NoConstraint,
+    RdwSpace,
+    SpaceInputs,
+    WindowConstraint,
+    window_presets,
+)
 
 NONE = {"type": "none"}
 INPUTS: dict[str, Any] = {
@@ -54,6 +65,7 @@ def space(inputs: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
 def test_the_kinds_are_registered() -> None:
     assert handlers.HANDLERS["rdw_space"] is rdw_space
     assert handlers.HANDLERS["rdw_space_point"] is rdw_space_point
+    assert handlers.HANDLERS["rdw_space_options"] is rdw_space_options
 
 
 @pytest.mark.medium
@@ -387,3 +399,172 @@ def test_the_bits_are_the_documented_ones() -> None:
         "no_soliton",
         "beyond_eos",
     ]
+
+
+# ------------------------------------------------------------------------ options
+
+CLASSES = {
+    "none": NoConstraint,
+    "fixed": FixedConstraint,
+    "damage": DamageConstraint,
+    "window": WindowConstraint,
+}
+SAMPLES = {
+    "length": 0.1,
+    "wavelength": 800e-9,
+    "energy_density": 2000.0,
+    "index": 2.6e-20,
+}
+
+
+def options() -> dict[str, Any]:
+    return rdw_space_options({})  # pyright: ignore[reportReturnType]
+
+
+def constraint_from(entry: dict[str, Any]) -> dict[str, Any]:
+    """Build a payload constraint from an entry's own field defaults and samples."""
+    out: dict[str, Any] = {"type": entry["name"]}
+    for field in entry["fields"]:
+        if field["alternative"] is not None:
+            out["preset"] = options()["window_presets"][0]["name"]
+        elif field["required"]:
+            out[field["name"]] = SAMPLES[field["kind"]]
+        elif field["name"] != "preset":
+            out[field["name"]] = field["default"]
+    if "preset" in out:
+        out.pop("material", None)
+        out.pop("elastic_limit", None)
+    return out
+
+
+def test_the_options_are_plain_data() -> None:
+    reply = options()
+    assert json.loads(json.dumps(reply)) == reply
+    assert rdw_space_options({"anything": 1}) == reply
+
+
+@pytest.mark.medium
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_a_constraint_built_from_its_own_fields_is_accepted(name: str) -> None:
+    entry = next(e for e in options()["constraint_types"] if e["name"] == name)
+    constraint = constraint_from(entry)
+    out = space({**INPUTS, "input_constraint": constraint}, points=6)
+    assert out["shape"] == [6, 6]
+
+
+def test_every_constraint_type_is_listed_in_order() -> None:
+    assert [e["name"] for e in options()["constraint_types"]] == list(CLASSES)
+
+
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_listed_names_are_exactly_the_accepted_keys(name: str) -> None:
+    entry = next(e for e in options()["constraint_types"] if e["name"] == name)
+    listed = [f["name"] for f in entry["fields"]]
+    accepted = {f.name for f in fields(CLASSES[name])} | (
+        {"preset"} if name == "window" else set()
+    )
+    assert sorted(listed) == sorted(accepted)
+    assert len(set(listed)) == len(listed)
+    # The handler refuses a key that is not listed: nothing is accepted unlisted.
+    with pytest.raises(SolpropError, match=r"not_a_field"):
+        _inputs(
+            {**INPUTS, "input_constraint": {"type": name, "not_a_field": 1.0}},
+        )
+    # And accepts each listed key (given a valid value for its kind).
+    base = constraint_from(entry)
+    for key in listed:
+        if key == "preset":
+            continue
+        _inputs({**INPUTS, "input_constraint": base})
+
+
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_fields_follow_the_dataclass_defaults(name: str) -> None:
+    entry = next(e for e in options()["constraint_types"] if e["name"] == name)
+    by_name = {f["name"]: f for f in entry["fields"]}
+    for field in fields(CLASSES[name]):
+        listed = by_name[field.name]
+        assert listed["required"] == (field.default is MISSING)
+        if listed["required"]:
+            assert listed["default"] is None
+            assert not listed["optional_none"]
+        else:
+            assert listed["default"] == field.default
+            # A field that defaults to None is one the user may leave empty.
+            assert (field.default is None) == listed["optional_none"]
+        assert listed["label"]
+        assert listed["help"]
+        assert Unit(listed["unit"]).text == listed["unit"]
+        assert listed["kind"] in {
+            "length",
+            "wavelength",
+            "time",
+            "energy_density",
+            "pressure",
+            "index",
+            "number",
+            "rounding",
+        }
+
+
+def test_the_presets_are_the_kernel_presets() -> None:
+    listed = options()["window_presets"]
+    real = window_presets()
+    assert [p["name"] for p in listed] == list(real)
+    for entry in listed:
+        preset = real[entry["name"]]
+        assert entry["n2"] == preset.n2
+        assert entry["elastic_limit"] == preset.elastic_limit
+        assert entry["source"] == preset.source
+        assert "HiSol" in entry["source"]
+    window = next(e for e in options()["constraint_types"] if e["name"] == "window")
+    choices = next(f for f in window["fields"] if f["name"] == "preset")
+    assert choices["kind"] == "choice"
+
+
+def test_the_defaults_are_the_space_input_defaults() -> None:
+    defaults = options()["defaults"]
+    assert defaults == {
+        "s_sf": 5.0,
+        "s_ion": 10.0,
+        "s_fiss": 1.5,
+        "s_loss": 1.0,
+        "kind": "HE",
+        "n": 1,
+        "m": 1,
+        "log_a": False,
+        "log_e": False,
+    }
+    assert set(defaults) == {
+        f.name
+        for f in fields(SpaceInputs)
+        if f.name
+        not in (
+            "gas",
+            "wavelength_target",
+            "wavelength_pump",
+            "fwhm",
+            "max_length",
+            "input_constraint",
+            "output_constraint",
+        )
+    }
+
+
+def test_the_soliton_terms_are_accepted_and_one_is_the_default() -> None:
+    terms = options()["soliton_terms"]
+    assert [t["name"] for t in terms] == ["solprop", "novoa", "none"]
+    assert [t["name"] for t in terms if t["default"]] == ["solprop"]
+    for term in terms:
+        assert term["label"]
+        assert space(soliton_term=term["name"], points=3)["shape"] == [3, 3]
+
+
+def test_the_limits_are_the_caps() -> None:
+    limits = options()["limits"]
+    assert limits["points"] == {"min": 2, "max": 1024}
+    assert limits["axis_entries"] == {"min": 2, "max": 4096}
+    with pytest.raises(SolpropError, match="points"):
+        space(points=1025)
+    with pytest.raises(SolpropError, match="points"):
+        space(points=1)
