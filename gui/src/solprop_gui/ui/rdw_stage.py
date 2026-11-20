@@ -254,12 +254,16 @@ class RdwStage(QWidget):
         self.status.setText(text)
 
     def _hold_toggled(self, on: bool) -> None:
-        """Hold the axes of the last full plot, or let solprop choose them again."""
+        """Hold the axes of the last (or next) full plot, or let solprop choose."""
         self._held = self._full_axes if on else None
         self._edited()
 
     def _edited(self) -> None:
         """Ask again: coarse once the editing rests briefly, full once it rests."""
+        # A point asked for at the old inputs no longer describes the form: its reply
+        # is dropped, and the point is asked for again at rest.
+        self._point_id = None
+        self._show_busy()
         if self.text is not None:
             self.text = None
             self.recipe_changed.emit()
@@ -383,7 +387,10 @@ class RdwStage(QWidget):
         space = decode_space_reply(value)
         self.space = space
         if self._space_points == FULL and self._held is None:
-            self._full_axes = (space.a, space.energy)
+            self._full_axes = (np.array(space.a), np.array(space.energy))
+            if self.model is not None and self.hold.isChecked():
+                # Held before any full plot had come: hold this one's.
+                self._held = self._full_axes
         self.plots.set_space(space)
         self.plots.set_message(
             "No allowed region for these inputs." if space.region_empty else None

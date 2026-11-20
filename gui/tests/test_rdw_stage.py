@@ -338,6 +338,91 @@ def test_inputs_changed_read_the_picked_point_again(
     assert payload["inputs"]["max_length"] == 4.0
 
 
+def fire(stage: RdwStage) -> None:
+    """Fire both request timers now, as the rest after an edit does."""
+    stage._coarse.stop()
+    stage._rest.stop()
+    stage._ask_space(COARSE)
+    stage._ask_full()
+
+
+def picked(stage: RdwStage, bridge: StubBridge, coarse: dict[str, Any]) -> int:
+    """Draw a space, pick a point and return the point request's id, unanswered."""
+    drawn(stage, bridge, coarse)
+    stage.pick(125e-6, 200e-6)
+    return bridge.of("rdw_space_point")[-1][0]
+
+
+def test_a_point_reply_for_inputs_since_edited_is_ignored(
+    stage: RdwStage, bridge: StubBridge, coarse: dict[str, Any]
+) -> None:
+    old = picked(stage, bridge, coarse)
+    edit(stage.fields["max_length"], "4")
+    bridge.answer(old, {"flags": [], "recipe_text": "OLD"})
+    assert stage.text is None
+    assert stage.readout.rowCount() == 0  # the readout is not filled from it
+    # The point asked for at the new inputs is taken.
+    fire(stage)
+    new = bridge.of("rdw_space_point")[-1]
+    assert new[0] != old and new[2]["inputs"]["max_length"] == 4.0
+    bridge.answer(new[0], {"flags": [], "recipe_text": "NEW"})
+    assert stage.text == "NEW"
+    assert stage.readout_text("Masks set") == "none"
+
+
+def test_a_point_reply_for_inputs_since_made_invalid_is_ignored(
+    qtbot: QtBot, stage: RdwStage, bridge: StubBridge, coarse: dict[str, Any]
+) -> None:
+    window_states: list[bool] = []
+    stage.recipe_changed.connect(lambda: window_states.append(stage.text is not None))
+    old = picked(stage, bridge, coarse)
+    stage.model.set("fwhm", "ten fs")  # pyright: ignore[reportOptionalMemberAccess]
+    stage._edited()
+    bridge.answer(old, {"flags": [], "recipe_text": "OLD"})
+    fire(stage)  # the new inputs do not read: nothing is asked
+    assert "fwhm" in stage.status.text()
+    assert len(bridge.of("rdw_space_point")) == 1
+    assert stage.text is None and stage.simulate_text() is None
+    assert True not in window_states  # Simulate this never came back on
+
+
+def test_holding_the_axes_before_any_full_plot_takes_the_first(
+    stage: RdwStage, bridge: StubBridge, pinned: dict[str, Any]
+) -> None:
+    stage.hold.setChecked(True)  # no full plot yet
+    fire(stage)
+    assert "axes" not in bridge.of("rdw_space")[-1][2]
+    bridge.answer(bridge.of("rdw_space")[-1][0], pinned)
+    bridge.sent.clear()
+    edit(stage.fields["fwhm"], "12")
+    fire(stage)
+    for _id, _kind, payload, _key in bridge.of("rdw_space"):
+        assert payload["axes"] == {"a": list(A_PINNED), "energy": list(E_PINNED)}
+    # Unticked: solprop's own axes again.
+    bridge.sent.clear()
+    stage.hold.setChecked(False)
+    fire(stage)
+    assert all("axes" not in s[2] for s in bridge.of("rdw_space"))
+
+
+def test_holding_again_takes_the_latest_full_plot_and_keeps_a_copy(
+    stage: RdwStage, bridge: StubBridge, pinned: dict[str, Any], coarse: dict[str, Any]
+) -> None:
+    drawn(stage, bridge, pinned)
+    stage.hold.setChecked(True)
+    stage.hold.setChecked(False)
+    drawn(stage, bridge, coarse)  # a newer full plot, on solprop's axes
+    stage.hold.setChecked(True)
+    assert stage.space is not None
+    held = stage._held
+    assert held is not None
+    assert np.array_equal(held[0], stage.space.a)
+    assert held[0] is not stage.space.a  # a copy, not the drawn space's array
+    bridge.sent.clear()
+    fire(stage)
+    assert bridge.of("rdw_space")[-1][2]["axes"]["a"] == list(stage.space.a)
+
+
 # ------------------------------------------------------------------ the form
 
 
