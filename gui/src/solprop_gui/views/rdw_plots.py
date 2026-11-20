@@ -71,6 +71,9 @@ LEVELS: Final = (0.0, 2.0)
 MASKED: Final = (150, 150, 150, 255)
 """The grey of a cell with no solution: no hue of the colour map comes near it."""
 
+_LEFT_AXIS_WIDTH: Final = 56
+"""Pixels of left margin on every panel: room for the first one's numbers and label."""
+
 _LABEL: Final = {"color": GREY, "font-size": "11px", "font-family": FONT}
 
 
@@ -246,6 +249,9 @@ class RdwPlots(QWidget):
         self.view.ci.layout.setHorizontalSpacing(6)  # pyright: ignore[reportAttributeAccessIssue]
         self.view.setMinimumHeight(240)
         column.addWidget(self.view, 1)
+        for column_index in range(len(PANELS)):
+            # Equal stretch: otherwise a column's share follows its title's width.
+            self.view.ci.layout.setColumnStretchFactor(column_index, 1)  # pyright: ignore[reportAttributeAccessIssue]
         self.plots: list[pg.PlotItem] = []
         self.images: list[pg.ImageItem] = []
         self.outlines: list[pg.PlotDataItem] = []
@@ -288,6 +294,7 @@ class RdwPlots(QWidget):
         """Make one panel, linked to the first."""
         plot = self.view.ci.addPlot(row=0, col=index)
         plot.setTitle(title, color=INK, size="10pt")
+        plot.setPreferredWidth(300.0)  # the same for all, so the stretch shares equally
         plot.hideButtons()
         plot.setMenuEnabled(False)
         box = plot.getViewBox()
@@ -308,9 +315,11 @@ class RdwPlots(QWidget):
             plot.getAxis("left").setLabel("Pulse energy (µJ)", **_LABEL)
         else:
             plot.getAxis("left").setStyle(showValues=False)
-            plot.getAxis("left").setWidth(6)
             box.setXLink(self.plots[0].getViewBox())
             box.setYLink(self.plots[0].getViewBox())
+        # The same left margin on every panel, so the four plot areas are equally wide:
+        # only the first shows numbers and a label, the others keep the room blank.
+        plot.getAxis("left").setWidth(_LEFT_AXIS_WIDTH)
         image = pg.ImageItem(axisOrder="row-major")
         plot.addItem(image)
         outline = pg.PlotDataItem(connect="pairs", pen=pg.mkPen("k", width=1.6))
