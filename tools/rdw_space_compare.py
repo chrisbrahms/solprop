@@ -13,7 +13,12 @@ repository root; it needs no Julia, it reads HiSol's numbers from the committed
 
 Table 1 puts HiSol's numbers for the canonical point (125 um, 200 uJ) beside solprop's
 own, computed from solprop's gas data, with the soliton term off (HiSol's linear phase
-match). Table 2 shows how much the soliton term moves the design.
+match). Table 2 shows how much the soliton term moves the design. Table 3 covers the
+noble gases (He, Ne, Ar, Kr, Xe) at 200 nm from 800 nm, 10 fs, 5 m, no constraints:
+gamma3, the density-area product, N_max and N_min, and whether an allowed region
+exists, beside HiSol's from the committed
+``tests/data/rdw_space/hisol_gases_reference.json`` (written by
+``tools/dump_hisol_gases_reference.jl``).
 """
 
 import argparse
@@ -25,7 +30,9 @@ from pathlib import Path
 
 import numpy as np
 
+from solprop import physdata
 from solprop.tools.rdw_space import (
+    NoConstraint,
     RdwSpace,
     SolitonTerm,
     SpaceInputs,
@@ -44,6 +51,7 @@ REFERENCE = (
     / "rdw_space"
     / "hisol_reference.json"
 )
+GASES_REFERENCE = REFERENCE.with_name("hisol_gases_reference.json")
 RADIUS = 125e-6
 ENERGY = 200e-6
 
@@ -202,6 +210,83 @@ def _print_term_table(inputs: SpaceInputs, points: int) -> None:
     print(f"{'allowed energies':<28s}" + "".join(f"{b[1]:>22s}" for b in boxes))
 
 
+def _num(value: object, spec: str) -> str:
+    """Return a number in `spec`, or ``none``."""
+    return "none" if value is None else format(float(value), spec)  # pyright: ignore[reportArgumentType]
+
+
+def _allowed_cells(inputs: SpaceInputs, term: SolitonTerm, points: int) -> str:
+    """Return how many cells of a `points`-square grid (automatic axes) are allowed."""
+    result = RdwSpace(term).compute(inputs, points)
+    return f"{int(result.ratios.allowed.sum())}/{points * points}"
+
+
+def _print_gas_table(reference: dict, points: int) -> None:
+    """Print table 3: each noble gas, solprop beside HiSol (each with its own data)."""
+    case = reference["case"]
+    head = (
+        f"{'gas':<5s}{'gamma3 sp':>12s}{'gamma3 HS':>12s}{'diff':>9s}"
+        f"{'rho a^2 sp':>12s}{'rho a^2 HS':>12s}{'N_max sp':>10s}{'N_max HS':>10s}"
+        f"{'N_min sp':>10s}{'N_min HS':>10s}{'region HS':>11s}"
+        f"{'allowed, off':>14s}{'allowed, sp':>13s}"
+    )
+    print(head)
+    print("-" * len(head))
+    for gas, hisol in reference["gases"].items():
+        inputs = SpaceInputs(
+            gas=gas,
+            wavelength_target=case["wavelength_target"],
+            wavelength_pump=case["wavelength_pump"],
+            fwhm=case["fwhm"],
+            max_length=case["max_length"],
+            input_constraint=NoConstraint(),
+            output_constraint=NoConstraint(),
+        )
+        gamma3 = physdata.gamma3(gas, wavelength=case["wavelength_pump"])
+        # With the term off, the density is the linear one at any radius, so N_max
+        # here is HiSol's rho a^2 form of it, read at one point.
+        point = RdwSpace(no_term).point(inputs, 100e-6, 100e-6)
+        diff = (gamma3 - hisol["gamma3"]) / hisol["gamma3"]
+        region = "yes" if hisol["region_exists"] else "no"
+        print(
+            f"{gas:<5s}{gamma3:>12.4e}{hisol['gamma3']:>12.4e}{diff:>+9.1%}"
+            f"{_num(point['rho_a2'], '.4e'):>12s}{hisol['rho_asq']:>12.4e}"
+            f"{_num(point['n_max'], '.4f'):>10s}{hisol['Nmax_rhoasq']:>10.4f}"
+            f"{_num(point['n_min'], '.4f'):>10s}{hisol['Nmin']:>10.4f}{region:>11s}"
+            f"{_allowed_cells(inputs, no_term, points):>14s}"
+            f"{_allowed_cells(inputs, solprop_half, points):>13s}"
+        )
+
+
+def _print_gases(points: int) -> None:
+    """Print table 3 with its heading, from the committed per-gas HiSol numbers."""
+    gases = json.loads(GASES_REFERENCE.read_text())
+    provenance = gases["provenance"]
+    case = gases["case"]
+    print("\nTable 3. The noble gases, each code with its OWN gas data")
+    print(
+        f"Case: {case['wavelength_target'] * 1e9:g} nm from "
+        f"{case['wavelength_pump'] * 1e9:g} nm, {case['fwhm'] * 1e15:g} fs, "
+        f"{case['max_length']:g} m, {case['mode']}, {case['constraints']}."
+    )
+    print(
+        f"HiSol numbers made at commit {provenance['hisol_commit']} "
+        f"(branch {provenance['hisol_branch']}) on {provenance['date']}"
+    )
+    print(f"  command: {provenance['command']}, Julia {provenance['julia_version']}")
+    print("sp = solprop, HS = HiSol (Luna's gas data); diff = (sp - HS) / HS.")
+    print("N_max: the rho a^2 form (linear limit) on both sides. region HS: HiSol's")
+    print("N_max > N_min and its min_energy/max_energy corners in order (from its")
+    print("closed forms, not a grid). allowed: allowed cells of solprop's own")
+    print(f"{points} x {points} grid, soliton term off and solprop_half.")
+    print("NOTE: the gamma3 differences are differences of the gas data (solprop's")
+    print("physdata/optmat against Luna's PhysData), not of this branch's formulas,")
+    print("which tests/test_rdw_space_hisol.py checks with HiSol's numbers injected.")
+    print("gamma3 sets n2 and so N_max (through the self-focusing and ionisation")
+    print("limits): where it differs, so does the region.\n")
+    _print_gas_table(gases, points)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the comparison report; return 0."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
@@ -257,6 +342,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("(gamma P_largest / 2); novoa_pr425 is the alternative")
     print("(gamma P_largest w/w_p).\n")
     _print_term_table(inputs, args.points)
+
+    _print_gases(args.points)
     return 0
 
 
