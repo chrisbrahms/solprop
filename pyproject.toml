@@ -240,6 +240,7 @@ max-positional-args = 5           # past this, parameters are keyword-only
 "tests/**"          = ["D", "ANN", "PLR2004", "ARG", "PLR0917"]
 "benchmarks/**"     = ["D", "ANN", "T20"]
 "tools/setup_light.py" = ["T20"]                     # it tells a contributor what to do
+"tools/rdw_space_*.py" = ["T20"]                     # report scripts: they print
 # Independent oracles that tests compare against: research code, held to the benchmark
 # rules rather than the package's.
 "tests/oracles/**"   = ["D", "ANN", "T20", "PLR2004", "ARG"]
